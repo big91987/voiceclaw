@@ -14,6 +14,28 @@ const kimiApiKey = 'sk-Oupbr9HRt6FUn2AAkzyntx7UR0BoDuudWQM0fTi1AOi9nanP';
 const kimiBaseUrl = 'https://api.moonshot.cn';
 const execFileAsync = promisify(execFile);
 
+// ============ 多轮对话历史 ============
+const MAX_HISTORY_ROUNDS = 100;
+interface ChatMessage { role: 'system' | 'user' | 'assistant'; content: string; }
+const chatHistory: ChatMessage[] = [
+  { role: 'system', content: '你是一个语音对话测试助手。回复简短自然，像跟人说话，不要太长。' }
+];
+
+function addToHistory(userMsg: string, assistantMsg: string) {
+  chatHistory.push({ role: 'user', content: userMsg });
+  chatHistory.push({ role: 'assistant', content: assistantMsg });
+  // 保留system消息 + 最多MAX_HISTORY_ROUNDS轮对话（每轮2条）
+  const maxMessages = 1 + MAX_HISTORY_ROUNDS * 2;
+  while (chatHistory.length > maxMessages) {
+    // 删除最早的一对对话（保留system）
+    chatHistory.splice(1, 2);
+  }
+}
+
+function getHistoryForApi(): ChatMessage[] {
+  return [...chatHistory];
+}
+
 function json(res: http.ServerResponse, code: number, data: unknown) {
   res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify(data));
@@ -179,10 +201,7 @@ async function streamChatWithKimi(
         model: 'kimi-k2-turbo-preview',
         max_tokens: 256,
         stream: true,
-        messages: [
-          { role: 'system', content: '你是一个语音对话测试助手。回复简短自然，像跟人说话，不要太长。' },
-          { role: 'user', content: text },
-        ],
+        messages: [...getHistoryForApi(), { role: 'user', content: text }],
       }),
     });
 
@@ -547,8 +566,8 @@ class StreamingAsrSession {
             const finalText = this.currentTurnText;
             this.sendEvent({ type: 'final', text: finalText });
 
-            // 记录已处理文本，用于下一轮过滤
-            this.lastProcessedText = (this.lastProcessedText ? this.lastProcessedText + ' ' : '') + finalText;
+            // 记录已处理文本，用于下一轮过滤（使用ASR返回的原始格式）
+            this.lastProcessedText = text;
 
             this.processReply(finalText).finally(() => {
               this.runningReply = false;
@@ -965,6 +984,10 @@ wss.on('connection', (client) => {
               firstAudioLatency: firstTtsAt ? firstTtsAt - llmStartAt : null,
               e2eMs: llmDoneAt - asrDoneAt,
             }));
+
+            // 保存到历史记录
+            addToHistory(text, fullReply);
+            console.log('[TEST] history saved, rounds=', (chatHistory.length - 1) / 2);
 
             send({
               type: 'reply_done',
