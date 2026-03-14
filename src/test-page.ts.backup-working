@@ -14,28 +14,6 @@ const kimiApiKey = 'sk-Oupbr9HRt6FUn2AAkzyntx7UR0BoDuudWQM0fTi1AOi9nanP';
 const kimiBaseUrl = 'https://api.moonshot.cn';
 const execFileAsync = promisify(execFile);
 
-// ============ 多轮对话历史 ============
-const MAX_HISTORY_ROUNDS = 100;
-interface ChatMessage { role: 'system' | 'user' | 'assistant'; content: string; }
-const chatHistory: ChatMessage[] = [
-  { role: 'system', content: '你是一个语音对话测试助手。回复简短自然，像跟人说话，不要太长。' }
-];
-
-function addToHistory(userMsg: string, assistantMsg: string) {
-  chatHistory.push({ role: 'user', content: userMsg });
-  chatHistory.push({ role: 'assistant', content: assistantMsg });
-  // 保留system消息 + 最多MAX_HISTORY_ROUNDS轮对话（每轮2条）
-  const maxMessages = 1 + MAX_HISTORY_ROUNDS * 2;
-  while (chatHistory.length > maxMessages) {
-    // 删除最早的一对对话（保留system）
-    chatHistory.splice(1, 2);
-  }
-}
-
-function getHistoryForApi(): ChatMessage[] {
-  return [...chatHistory];
-}
-
 function json(res: http.ServerResponse, code: number, data: unknown) {
   res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify(data));
@@ -201,7 +179,10 @@ async function streamChatWithKimi(
         model: 'kimi-k2-turbo-preview',
         max_tokens: 256,
         stream: true,
-        messages: [...getHistoryForApi(), { role: 'user', content: text }],
+        messages: [
+          { role: 'system', content: '你是一个语音对话测试助手。回复简短自然，像跟人说话，不要太长。' },
+          { role: 'user', content: text },
+        ],
       }),
     });
 
@@ -315,10 +296,12 @@ class TtsConnection {
       console.log(`[TTS_CONN] msg type=${type} flag=${flag} event=${event} payloadLen=${payload.length}`);
 
       if (type === 9 && event === 50) {
-        // 服务端准备好，等待processQueue来创建session（避免重复创建）
-        console.log('[TTS_CONN] server ready (50), waiting for job');
-        this.ready = true;
-        this.processQueue();
+        // 服务端准备好，发送 session 建立
+        console.log('[TTS_CONN] sending session create');
+        this.ws?.send(this.makeEvent(100, this.sessionId, {
+          user: { uid: uuidv4() },
+          req_params: { speaker: 'zh_female_vv_uranus_bigtts', audio_params: { format: 'mp3', sample_rate: 24000 } },
+        }));
       } else if (type === 9 && event === 150) {
         // session 建立成功，发送文本和 finish
         console.log('[TTS_CONN] session ready, sending text');
@@ -388,12 +371,13 @@ class TtsConnection {
 
   private processQueue() {
     console.log(`[TTS_CONN] processQueue: ready=${this.ready}, currentJob=${!!this.currentJob}, queueLen=${this.pendingQueue.length}`);
-    if (!this.ready || this.currentJob || this.pendingQueue.length === 0) return;
+    if (this.currentJob || this.pendingQueue.length === 0) return;
     const job = this.pendingQueue.shift()!;
     console.log(`[TTS_CONN] starting synthesis: ${job.text.substring(0, 20)}`);
     this.currentJob = { text: job.text, onChunk: job.onChunk, onDone: job.onDone, onError: job.onError };
     // 每句新建 session（连接复用）
     this.sessionId = uuidv4();
+    this.ready = false;
     this.ws?.send(this.makeEvent(100, this.sessionId, {
       user: { uid: uuidv4() },
       req_params: { speaker: 'zh_female_vv_uranus_bigtts', audio_params: { format: 'mp3', sample_rate: 24000 } },
@@ -510,7 +494,7 @@ class StreamingAsrSession {
         if (!this.ready) {
           this.ready = true;
           this.sendEvent({ type: 'ready' });
-          // 1.9.2: 不再 return，继续处理首条消息，避免首句丢失
+          return;
         }
 
         // 对于 partial 显示，过滤掉上一轮已处理的文本前缀
@@ -566,8 +550,8 @@ class StreamingAsrSession {
             const finalText = this.currentTurnText;
             this.sendEvent({ type: 'final', text: finalText });
 
-            // 记录已处理文本，用于下一轮过滤（使用ASR返回的原始格式）
-            this.lastProcessedText = text;
+            // 记录已处理文本，用于下一轮过滤
+            this.lastProcessedText = (this.lastProcessedText ? this.lastProcessedText + ' ' : '') + finalText;
 
             this.processReply(finalText).finally(() => {
               this.runningReply = false;
@@ -889,810 +873,6 @@ stopBtn.addEventListener('click', stopStreaming);
 renderMetrics();
 </script></body></html>`;
 
-const phase18Page = `<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>VoiceClaw Phase 1.8</title>
-<style>
-body{font-family:system-ui;padding:24px;max-width:920px;margin:auto;background:#0b1020;color:#e8ecff}
-button{padding:12px 18px;border-radius:12px;border:none;background:#5b7cff;color:white;font-size:16px;cursor:pointer}
-button.off{background:#eb4d4b}
-.card{background:#121933;padding:16px;border-radius:16px;margin-top:16px}
-.mono{white-space:pre-wrap;font-family:ui-monospace,monospace}
-.state{display:inline-block;padding:6px 10px;border-radius:999px;background:#1f2a57;margin-left:8px}
-.hint{opacity:.8;font-size:14px;margin-top:10px}
-</style></head><body>
-<h1>VoiceClaw Phase 1.8（一键通话）</h1>
-<p>只保留一个按钮：<b>点一次连接并持续对话，再点一次断开连接</b>。</p>
-<p><a href="/phase1">返回 phase1 调试页</a></p>
-<div>
-  <button id="toggleBtn">连接并开始对话</button>
-  <span class="state" id="state">idle</span>
-</div>
-<div class="hint">连接后会持续采集麦克风并自动多轮对话；再次点击按钮立即断开。</div>
-<div class="card"><b>最新识别：</b><div id="asr" class="mono"></div></div>
-<div class="card"><b>助手回复：</b><div id="reply" class="mono"></div></div>
-<div class="card"><b>调试时间线：</b><div id="debug" class="mono"></div></div>
-<script>
-const btn = document.getElementById('toggleBtn');
-const stateEl = document.getElementById('state');
-const asrEl = document.getElementById('asr');
-const replyEl = document.getElementById('reply');
-const debugEl = document.getElementById('debug');
-let stream, ws, audioCtx, source, processor;
-let connected = false;
-let currentReply = '';
-let accumulatedAudio = '';
-const player = new Audio();
-let marks = {};
-
-function now(){ return performance.now(); }
-function fmt(ms){ return ms == null ? '-' : ms.toFixed(1) + 'ms'; }
-function mark(name){ marks[name] = now(); renderDebug(); }
-function resetMarks(){ marks = { turnStart: now() }; renderDebug(); }
-function renderDebug(serverMetrics){
-  const lines = [];
-  const delta = (a,b) => (marks[a] != null && marks[b] != null) ? (marks[b] - marks[a]) : null;
-  lines.push('ws_open=' + fmt(delta('turnStart','wsOpen')));
-  lines.push('asr=' + fmt(delta('turnStart','finalAsr')));
-  lines.push('llm首字=' + fmt(delta('finalAsr','firstReplyText')));
-  lines.push('首音频包=' + fmt(delta('finalAsr','firstAudioChunk')));
-  lines.push('回包完成=' + fmt(delta('finalAsr','replyDone')));
-  lines.push('开始播放=' + fmt(delta('finalAsr','audioPlayStart')));
-  if (serverMetrics) {
-    lines.push('--- server metrics ---');
-    lines.push('llmMs=' + fmt(serverMetrics.llmMs));
-    lines.push('ttsMs=' + fmt(serverMetrics.ttsMs));
-    lines.push('firstAudioLatency=' + fmt(serverMetrics.firstAudioLatency));
-  }
-  debugEl.textContent = lines.join('\\n');
-}
-
-function setState(s){ stateEl.textContent = s; }
-function floatTo16BitPCM(float32Array){
-  const buffer = new ArrayBuffer(float32Array.length * 2);
-  const view = new DataView(buffer);
-  let offset = 0;
-  for (let i = 0; i < float32Array.length; i++, offset += 2) {
-    let v = Math.max(-1, Math.min(1, float32Array[i]));
-    view.setInt16(offset, v < 0 ? v * 0x8000 : v * 0x7FFF, true);
-  }
-  return buffer;
-}
-
-function queueAudioChunk(base64Data){ accumulatedAudio += base64Data || ''; }
-function playAccumulatedAudio(){
-  if (!accumulatedAudio) return;
-  mark('audioPlayStart');
-  player.src = 'data:audio/mpeg;base64,' + accumulatedAudio;
-  player.play().catch(() => {});
-}
-
-async function connectAndTalk(){
-  if (connected) return;
-  resetMarks();
-  connected = true;
-  btn.textContent = '断开连接';
-  btn.classList.add('off');
-  setState('connecting');
-
-  stream = await navigator.mediaDevices.getUserMedia({
-    audio: { channelCount: 1, sampleRate: 16000, echoCancellation: true, noiseSuppression: true, autoGainControl: true }
-  });
-
-  ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws/phase1');
-  ws.binaryType = 'arraybuffer';
-
-  ws.onopen = () => {
-    mark('wsOpen');
-    ws.send(JSON.stringify({ type: 'start', codec: 'pcm16le', sampleRate: 16000 }));
-    audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
-    source = audioCtx.createMediaStreamSource(stream);
-    processor = audioCtx.createScriptProcessor(4096, 1, 1);
-    processor.onaudioprocess = (event) => {
-      if (!ws || ws.readyState !== 1) return;
-      const input = event.inputBuffer.getChannelData(0);
-      ws.send(floatTo16BitPCM(input));
-    };
-    source.connect(processor);
-    processor.connect(audioCtx.destination);
-    setState('streaming');
-  };
-
-  ws.onmessage = (evt) => {
-    const msg = JSON.parse(evt.data);
-    if (msg.type === 'final') {
-      mark('finalAsr');
-      asrEl.textContent = msg.text || '';
-      setState('thinking');
-      currentReply = '';
-      accumulatedAudio = '';
-    }
-    if (msg.type === 'reply_text') {
-      if (!marks.firstReplyText) mark('firstReplyText');
-      currentReply += msg.text || '';
-      replyEl.textContent = currentReply;
-    }
-    if (msg.type === 'audio_chunk' && msg.audioChunk) {
-      if (!marks.firstAudioChunk) mark('firstAudioChunk');
-      queueAudioChunk(msg.audioChunk);
-      setState('speaking');
-    }
-    if (msg.type === 'reply_done') {
-      mark('replyDone');
-      playAccumulatedAudio();
-      renderDebug(msg.metrics || undefined);
-      setState('streaming');
-    }
-    if (msg.type === 'error') {
-      replyEl.textContent = '错误：' + (msg.error || 'unknown');
-      disconnect();
-    }
-  };
-
-  ws.onclose = () => {
-    if (connected) disconnect();
-  };
-}
-
-function disconnect(){
-  if (!connected) return;
-  connected = false;
-  try { if (processor) processor.disconnect(); } catch {}
-  try { if (source) source.disconnect(); } catch {}
-  try { if (audioCtx) audioCtx.close(); } catch {}
-  try { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'stop' })); } catch {}
-  try { if (ws) ws.close(); } catch {}
-  try { if (stream) stream.getTracks().forEach(t => t.stop()); } catch {}
-  btn.textContent = '连接并开始对话';
-  btn.classList.remove('off');
-  setState('idle');
-  renderDebug();
-}
-
-btn.addEventListener('click', () => {
-  if (connected) disconnect(); else connectAndTalk().catch((e) => {
-    replyEl.textContent = '连接失败：' + (e?.message || e);
-    disconnect();
-  });
-});
-</script></body></html>`;
-
-const phase19Page = `<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>VoiceClaw Phase 1.9</title>
-<style>
-body{font-family:system-ui;padding:24px;max-width:920px;margin:auto;background:#0b1020;color:#e8ecff}
-button{padding:12px 18px;border-radius:12px;border:none;background:#5b7cff;color:white;font-size:16px;cursor:pointer}
-button.off{background:#eb4d4b}
-.card{background:#121933;padding:16px;border-radius:16px;margin-top:16px}
-.mono{white-space:pre-wrap;font-family:ui-monospace,monospace}
-.state{display:inline-block;padding:6px 10px;border-radius:999px;background:#1f2a57;margin-left:8px}
-.hint{opacity:.8;font-size:14px;margin-top:10px}
-</style></head><body>
-<h1>VoiceClaw Phase 1.9（流式播报）</h1>
-<p>一键连接持续对话 + <b>TTS 分片实时播放（边生成边播）</b>。</p>
-<p><a href="/phase18">返回 phase1.8</a></p>
-<div>
-  <button id="toggleBtn">连接并开始对话</button>
-  <span class="state" id="state">idle</span>
-</div>
-<div class="hint">连接后持续采集麦克风；再次点击断开。收到 audio_chunk 即刻排队播放。</div>
-<div class="card"><b>最新识别：</b><div id="asr" class="mono"></div></div>
-<div class="card"><b>助手回复：</b><div id="reply" class="mono"></div></div>
-<div class="card"><b>调试时间线：</b><div id="debug" class="mono"></div></div>
-<script>
-const btn = document.getElementById('toggleBtn');
-const stateEl = document.getElementById('state');
-const asrEl = document.getElementById('asr');
-const replyEl = document.getElementById('reply');
-const debugEl = document.getElementById('debug');
-let stream, ws, audioCtx, source, processor;
-let connected = false;
-let currentReply = '';
-let marks = {};
-
-// 流式音频分片播放队列（1.9核心）
-let chunkQueue = [];
-let chunkPlaying = false;
-
-function now(){ return performance.now(); }
-function fmt(ms){ return ms == null ? '-' : ms.toFixed(1) + 'ms'; }
-function mark(name){ marks[name] = now(); renderDebug(); }
-function resetMarks(){ marks = { turnStart: now() }; renderDebug(); }
-function renderDebug(serverMetrics){
-  const lines = [];
-  const delta = (a,b) => (marks[a] != null && marks[b] != null) ? (marks[b] - marks[a]) : null;
-  lines.push('ws_open=' + fmt(delta('turnStart','wsOpen')));
-  lines.push('asr=' + fmt(delta('turnStart','finalAsr')));
-  lines.push('llm首字=' + fmt(delta('finalAsr','firstReplyText')));
-  lines.push('首音频包=' + fmt(delta('finalAsr','firstAudioChunk')));
-  lines.push('开始播放=' + fmt(delta('finalAsr','audioPlayStart')));
-  lines.push('回包完成=' + fmt(delta('finalAsr','replyDone')));
-  if (serverMetrics) {
-    lines.push('--- server metrics ---');
-    lines.push('llmMs=' + fmt(serverMetrics.llmMs));
-    lines.push('ttsMs=' + fmt(serverMetrics.ttsMs));
-    lines.push('firstAudioLatency=' + fmt(serverMetrics.firstAudioLatency));
-  }
-  debugEl.textContent = lines.join('\\n');
-}
-
-function setState(s){ stateEl.textContent = s; }
-function floatTo16BitPCM(float32Array){
-  const buffer = new ArrayBuffer(float32Array.length * 2);
-  const view = new DataView(buffer);
-  let offset = 0;
-  for (let i = 0; i < float32Array.length; i++, offset += 2) {
-    let v = Math.max(-1, Math.min(1, float32Array[i]));
-    view.setInt16(offset, v < 0 ? v * 0x8000 : v * 0x7FFF, true);
-  }
-  return buffer;
-}
-
-function enqueueChunk(base64Data){
-  if (!base64Data) return;
-  chunkQueue.push(base64Data);
-  if (!chunkPlaying) playNextChunk();
-}
-
-function playNextChunk(){
-  if (chunkQueue.length === 0) { chunkPlaying = false; return; }
-  chunkPlaying = true;
-  const chunk = chunkQueue.shift();
-  const a = new Audio('data:audio/mpeg;base64,' + chunk);
-  if (!marks.audioPlayStart) mark('audioPlayStart');
-  a.onended = () => playNextChunk();
-  a.onerror = () => playNextChunk();
-  a.play().catch(() => playNextChunk());
-}
-
-async function connectAndTalk(){
-  if (connected) return;
-  resetMarks();
-  connected = true;
-  btn.textContent = '断开连接';
-  btn.classList.add('off');
-  setState('connecting');
-
-  stream = await navigator.mediaDevices.getUserMedia({
-    audio: { channelCount: 1, sampleRate: 16000, echoCancellation: true, noiseSuppression: true, autoGainControl: true }
-  });
-
-  ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws/phase1');
-  ws.binaryType = 'arraybuffer';
-
-  ws.onopen = () => {
-    mark('wsOpen');
-    ws.send(JSON.stringify({ type: 'start', codec: 'pcm16le', sampleRate: 16000 }));
-    audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
-    source = audioCtx.createMediaStreamSource(stream);
-    processor = audioCtx.createScriptProcessor(4096, 1, 1);
-    processor.onaudioprocess = (event) => {
-      if (!ws || ws.readyState !== 1) return;
-      const input = event.inputBuffer.getChannelData(0);
-      ws.send(floatTo16BitPCM(input));
-    };
-    source.connect(processor);
-    processor.connect(audioCtx.destination);
-    setState('streaming');
-  };
-
-  ws.onmessage = (evt) => {
-    const msg = JSON.parse(evt.data);
-    if (msg.type === 'final') {
-      mark('finalAsr');
-      asrEl.textContent = msg.text || '';
-      setState('thinking');
-      currentReply = '';
-      chunkQueue = [];
-      chunkPlaying = false;
-    }
-    if (msg.type === 'reply_text') {
-      if (!marks.firstReplyText) mark('firstReplyText');
-      currentReply += msg.text || '';
-      replyEl.textContent = currentReply;
-    }
-    if (msg.type === 'audio_chunk' && msg.audioChunk) {
-      if (!marks.firstAudioChunk) mark('firstAudioChunk');
-      enqueueChunk(msg.audioChunk);
-      setState('speaking');
-    }
-    if (msg.type === 'reply_done') {
-      mark('replyDone');
-      renderDebug(msg.metrics || undefined);
-      setState('streaming');
-    }
-    if (msg.type === 'error') {
-      replyEl.textContent = '错误：' + (msg.error || 'unknown');
-      disconnect();
-    }
-  };
-
-  ws.onclose = () => {
-    if (connected) disconnect();
-  };
-}
-
-function disconnect(){
-  if (!connected) return;
-  connected = false;
-  try { if (processor) processor.disconnect(); } catch {}
-  try { if (source) source.disconnect(); } catch {}
-  try { if (audioCtx) audioCtx.close(); } catch {}
-  try { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'stop' })); } catch {}
-  try { if (ws) ws.close(); } catch {}
-  try { if (stream) stream.getTracks().forEach(t => t.stop()); } catch {}
-  chunkQueue = [];
-  chunkPlaying = false;
-  btn.textContent = '连接并开始对话';
-  btn.classList.remove('off');
-  setState('idle');
-  renderDebug();
-}
-
-btn.addEventListener('click', () => {
-  if (connected) disconnect(); else connectAndTalk().catch((e) => {
-    replyEl.textContent = '连接失败：' + (e?.message || e);
-    disconnect();
-  });
-});
-</script></body></html>`;
-
-const phase191Page = `<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>VoiceClaw Phase 1.9.1</title>
-<style>
-body{font-family:system-ui;padding:24px;max-width:920px;margin:auto;background:#0b1020;color:#e8ecff}
-button{padding:12px 18px;border-radius:12px;border:none;background:#5b7cff;color:white;font-size:16px;cursor:pointer}
-button.off{background:#eb4d4b}
-.card{background:#121933;padding:16px;border-radius:16px;margin-top:16px}
-.mono{white-space:pre-wrap;font-family:ui-monospace,monospace}
-.state{display:inline-block;padding:6px 10px;border-radius:999px;background:#1f2a57;margin-left:8px}
-.hint{opacity:.8;font-size:14px;margin-top:10px}
-</style></head><body>
-<h1>VoiceClaw Phase 1.9.1（平滑流式播报）</h1>
-<p>WebAudio 时间轴连续播放 + 启动缓冲，减少分片停顿。</p>
-<p><a href="/phase19">返回 phase1.9</a></p>
-<div>
-  <button id="toggleBtn">连接并开始对话</button>
-  <span class="state" id="state">idle</span>
-</div>
-<div class="hint">参数：首播缓冲≈220ms；时间轴拼接；自动防抖。</div>
-<div class="card"><b>最新识别：</b><div id="asr" class="mono"></div></div>
-<div class="card"><b>助手回复：</b><div id="reply" class="mono"></div></div>
-<div class="card"><b>调试时间线：</b><div id="debug" class="mono"></div></div>
-<script>
-const btn = document.getElementById('toggleBtn');
-const stateEl = document.getElementById('state');
-const asrEl = document.getElementById('asr');
-const replyEl = document.getElementById('reply');
-const debugEl = document.getElementById('debug');
-let stream, ws, micCtx, source, processor;
-let connected = false;
-let currentReply = '';
-let marks = {};
-
-// 播放引擎（1.9.1 核心）
-let playCtx;
-let nextPlayTime = 0;
-let started = false;
-let pendingDur = 0;
-let decodeChain = Promise.resolve();
-const START_BUFFER_SEC = 0.22;
-const SAFETY_GAP_SEC = 0.015;
-
-function now(){ return performance.now(); }
-function fmt(ms){ return ms == null ? '-' : ms.toFixed(1) + 'ms'; }
-function mark(name){ marks[name] = now(); renderDebug(); }
-function resetMarks(){ marks = { turnStart: now() }; renderDebug(); }
-function renderDebug(serverMetrics){
-  const lines = [];
-  const delta = (a,b) => (marks[a] != null && marks[b] != null) ? (marks[b] - marks[a]) : null;
-  lines.push('ws_open=' + fmt(delta('turnStart','wsOpen')));
-  lines.push('asr=' + fmt(delta('turnStart','finalAsr')));
-  lines.push('llm首字=' + fmt(delta('finalAsr','firstReplyText')));
-  lines.push('首音频包=' + fmt(delta('finalAsr','firstAudioChunk')));
-  lines.push('开始播放=' + fmt(delta('finalAsr','audioPlayStart')));
-  lines.push('回包完成=' + fmt(delta('finalAsr','replyDone')));
-  if (serverMetrics) {
-    lines.push('--- server metrics ---');
-    lines.push('llmMs=' + fmt(serverMetrics.llmMs));
-    lines.push('ttsMs=' + fmt(serverMetrics.ttsMs));
-    lines.push('firstAudioLatency=' + fmt(serverMetrics.firstAudioLatency));
-  }
-  debugEl.textContent = lines.join('\\n');
-}
-
-function setState(s){ stateEl.textContent = s; }
-function floatTo16BitPCM(float32Array){
-  const buffer = new ArrayBuffer(float32Array.length * 2);
-  const view = new DataView(buffer);
-  let offset = 0;
-  for (let i = 0; i < float32Array.length; i++, offset += 2) {
-    let v = Math.max(-1, Math.min(1, float32Array[i]));
-    view.setInt16(offset, v < 0 ? v * 0x8000 : v * 0x7FFF, true);
-  }
-  return buffer;
-}
-
-function resetPlayer(){
-  started = false;
-  pendingDur = 0;
-  nextPlayTime = 0;
-  decodeChain = Promise.resolve();
-  if (!playCtx) {
-    playCtx = new (window.AudioContext || window.webkitAudioContext)();
-  }
-}
-
-function base64ToArrayBuffer(base64){
-  const binary = atob(base64);
-  const len = binary.length;
-  const bytes = new Uint8Array(len);
-  for (let i=0;i<len;i++) bytes[i] = binary.charCodeAt(i);
-  return bytes.buffer;
-}
-
-function enqueueChunk(base64Data){
-  if (!base64Data) return;
-  const arr = base64ToArrayBuffer(base64Data);
-  decodeChain = decodeChain.then(async () => {
-    if (!playCtx) return;
-    const audioBuf = await playCtx.decodeAudioData(arr.slice(0));
-    pendingDur += audioBuf.duration;
-
-    if (!started && pendingDur < START_BUFFER_SEC) return;
-
-    if (!started) {
-      started = true;
-      if (!marks.audioPlayStart) mark('audioPlayStart');
-      nextPlayTime = Math.max(playCtx.currentTime + 0.03, nextPlayTime || 0);
-    }
-
-    const src = playCtx.createBufferSource();
-    src.buffer = audioBuf;
-    src.connect(playCtx.destination);
-    src.start(nextPlayTime);
-    nextPlayTime += Math.max(0.001, audioBuf.duration - SAFETY_GAP_SEC);
-    pendingDur = Math.max(0, pendingDur - audioBuf.duration);
-  }).catch(()=>{});
-}
-
-async function connectAndTalk(){
-  if (connected) return;
-  resetMarks();
-  resetPlayer();
-  connected = true;
-  btn.textContent = '断开连接';
-  btn.classList.add('off');
-  setState('connecting');
-
-  stream = await navigator.mediaDevices.getUserMedia({
-    audio: { channelCount: 1, sampleRate: 16000, echoCancellation: true, noiseSuppression: true, autoGainControl: true }
-  });
-
-  ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws/phase1');
-  ws.binaryType = 'arraybuffer';
-
-  ws.onopen = () => {
-    mark('wsOpen');
-    ws.send(JSON.stringify({ type: 'start', codec: 'pcm16le', sampleRate: 16000 }));
-    micCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
-    source = micCtx.createMediaStreamSource(stream);
-    processor = micCtx.createScriptProcessor(4096, 1, 1);
-    processor.onaudioprocess = (event) => {
-      if (!ws || ws.readyState !== 1) return;
-      const input = event.inputBuffer.getChannelData(0);
-      ws.send(floatTo16BitPCM(input));
-    };
-    source.connect(processor);
-    processor.connect(micCtx.destination);
-    setState('streaming');
-  };
-
-  ws.onmessage = (evt) => {
-    const msg = JSON.parse(evt.data);
-    if (msg.type === 'final') {
-      mark('finalAsr');
-      asrEl.textContent = msg.text || '';
-      setState('thinking');
-      currentReply = '';
-      resetPlayer();
-    }
-    if (msg.type === 'reply_text') {
-      if (!marks.firstReplyText) mark('firstReplyText');
-      currentReply += msg.text || '';
-      replyEl.textContent = currentReply;
-    }
-    if (msg.type === 'audio_chunk' && msg.audioChunk) {
-      if (!marks.firstAudioChunk) mark('firstAudioChunk');
-      enqueueChunk(msg.audioChunk);
-      setState('speaking');
-    }
-    if (msg.type === 'reply_done') {
-      mark('replyDone');
-      renderDebug(msg.metrics || undefined);
-      setState('streaming');
-    }
-    if (msg.type === 'error') {
-      replyEl.textContent = '错误：' + (msg.error || 'unknown');
-      disconnect();
-    }
-  };
-
-  ws.onclose = () => { if (connected) disconnect(); };
-}
-
-function disconnect(){
-  if (!connected) return;
-  connected = false;
-  try { if (processor) processor.disconnect(); } catch {}
-  try { if (source) source.disconnect(); } catch {}
-  try { if (micCtx) micCtx.close(); } catch {}
-  try { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'stop' })); } catch {}
-  try { if (ws) ws.close(); } catch {}
-  try { if (stream) stream.getTracks().forEach(t => t.stop()); } catch {}
-  btn.textContent = '连接并开始对话';
-  btn.classList.remove('off');
-  setState('idle');
-  renderDebug();
-}
-
-btn.addEventListener('click', () => {
-  if (connected) disconnect();
-  else connectAndTalk().catch((e) => { replyEl.textContent = '连接失败：' + (e?.message || e); disconnect(); });
-});
-</script></body></html>`;
-
-const phase192Page = `<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>VoiceClaw Phase 1.9.2</title>
-<style>
-body{font-family:system-ui;padding:24px;max-width:920px;margin:auto;background:#0b1020;color:#e8ecff}
-button{padding:12px 18px;border-radius:12px;border:none;background:#5b7cff;color:white;font-size:16px;cursor:pointer}
-button.off{background:#eb4d4b}
-.card{background:#121933;padding:16px;border-radius:16px;margin-top:16px}
-.mono{white-space:pre-wrap;font-family:ui-monospace,monospace}
-.state{display:inline-block;padding:6px 10px;border-radius:999px;background:#1f2a57;margin-left:8px}
-.hint{opacity:.8;font-size:14px;margin-top:10px}
-</style></head><body>
-<h1>VoiceClaw Phase 1.9.2（首句修复）</h1>
-<p>基于 1.9.1：修复“首条 ASR 消息被丢弃”问题。</p>
-<p><a href="/phase191">返回 phase1.9.1</a></p>
-<div>
-  <button id="toggleBtn">连接并开始对话</button>
-  <span class="state" id="state">idle</span>
-</div>
-<div class="hint">此页仅用于验证首句识别是否恢复稳定。</div>
-<div class="card"><b>最新识别：</b><div id="asr" class="mono"></div></div>
-<div class="card"><b>助手回复：</b><div id="reply" class="mono"></div></div>
-<div class="card"><b>调试时间线：</b><div id="debug" class="mono"></div></div>
-<script>
-const btn = document.getElementById('toggleBtn');
-const stateEl = document.getElementById('state');
-const asrEl = document.getElementById('asr');
-const replyEl = document.getElementById('reply');
-const debugEl = document.getElementById('debug');
-let stream, ws, micCtx, source, processor;
-let connected = false;
-let currentReply = '';
-let marks = {};
-let playCtx;
-let canSendAudio = false;
-let pcmPrebuffer = [];
-const MAX_PREBUFFER_CHUNKS = 12;
-let activeTurnId = 0;
-let playerGeneration = 0;
-let activeSources = [];
-let nextPlayTime = 0;
-let started = false;
-let pendingDur = 0;
-let decodeChain = Promise.resolve();
-const START_BUFFER_SEC = 0.22;
-const SAFETY_GAP_SEC = 0.015;
-
-function now(){ return performance.now(); }
-function fmt(ms){ return ms == null ? '-' : ms.toFixed(1) + 'ms'; }
-function mark(name){ marks[name] = now(); renderDebug(); }
-function resetMarks(){ marks = { turnStart: now() }; renderDebug(); }
-function renderDebug(serverMetrics){
-  const lines = [];
-  const delta = (a,b) => (marks[a] != null && marks[b] != null) ? (marks[b] - marks[a]) : null;
-  lines.push('ws_open=' + fmt(delta('turnStart','wsOpen')));
-  lines.push('asr=' + fmt(delta('turnStart','finalAsr')));
-  lines.push('llm首字=' + fmt(delta('finalAsr','firstReplyText')));
-  lines.push('首音频包=' + fmt(delta('finalAsr','firstAudioChunk')));
-  lines.push('开始播放=' + fmt(delta('finalAsr','audioPlayStart')));
-  lines.push('回包完成=' + fmt(delta('finalAsr','replyDone')));
-  if (serverMetrics) {
-    lines.push('--- server metrics ---');
-    lines.push('llmMs=' + fmt(serverMetrics.llmMs));
-    lines.push('ttsMs=' + fmt(serverMetrics.ttsMs));
-    lines.push('firstAudioLatency=' + fmt(serverMetrics.firstAudioLatency));
-  }
-  debugEl.textContent = lines.join('\\n');
-}
-
-function setState(s){ stateEl.textContent = s; }
-function floatTo16BitPCM(float32Array){
-  const buffer = new ArrayBuffer(float32Array.length * 2);
-  const view = new DataView(buffer);
-  let offset = 0;
-  for (let i = 0; i < float32Array.length; i++, offset += 2) {
-    let v = Math.max(-1, Math.min(1, float32Array[i]));
-    view.setInt16(offset, v < 0 ? v * 0x8000 : v * 0x7FFF, true);
-  }
-  return buffer;
-}
-
-function resetPlayer(){
-  playerGeneration += 1;
-  for (const s of activeSources) { try { s.stop(); } catch {} }
-  activeSources = [];
-  started = false;
-  pendingDur = 0;
-  nextPlayTime = 0;
-  decodeChain = Promise.resolve();
-  if (!playCtx) playCtx = new (window.AudioContext || window.webkitAudioContext)();
-}
-
-function base64ToArrayBuffer(base64){
-  const binary = atob(base64);
-  const len = binary.length;
-  const bytes = new Uint8Array(len);
-  for (let i=0;i<len;i++) bytes[i] = binary.charCodeAt(i);
-  return bytes.buffer;
-}
-
-function enqueueChunk(base64Data, turnId){
-  if (!base64Data) return;
-  if (turnId && turnId !== activeTurnId) return;
-  const gen = playerGeneration;
-  const arr = base64ToArrayBuffer(base64Data);
-  decodeChain = decodeChain.then(async () => {
-    if (!playCtx) return;
-    if (gen !== playerGeneration) return;
-    const audioBuf = await playCtx.decodeAudioData(arr.slice(0));
-    pendingDur += audioBuf.duration;
-    if (!started && pendingDur < START_BUFFER_SEC) return;
-    if (!started) {
-      started = true;
-      if (!marks.audioPlayStart) mark('audioPlayStart');
-      nextPlayTime = Math.max(playCtx.currentTime + 0.03, nextPlayTime || 0);
-    }
-    const src = playCtx.createBufferSource();
-    src.buffer = audioBuf;
-    src.connect(playCtx.destination);
-    activeSources.push(src);
-    src.onended = () => { activeSources = activeSources.filter(x => x !== src); };
-    src.start(nextPlayTime);
-    nextPlayTime += Math.max(0.001, audioBuf.duration - SAFETY_GAP_SEC);
-    pendingDur = Math.max(0, pendingDur - audioBuf.duration);
-  }).catch(()=>{});
-}
-
-async function connectAndTalk(){
-  if (connected) return;
-  resetMarks();
-  resetPlayer();
-  canSendAudio = false;
-  pcmPrebuffer = [];
-  connected = true;
-  btn.textContent = '断开连接';
-  btn.classList.add('off');
-  setState('requesting_mic');
-
-  try {
-    stream = await navigator.mediaDevices.getUserMedia({
-      audio: { channelCount: 1, sampleRate: 16000, echoCancellation: true, noiseSuppression: true, autoGainControl: true }
-    });
-  } catch (e) {
-    replyEl.textContent = '麦克风权限失败：' + (e?.message || e);
-    disconnect();
-    return;
-  }
-
-  setState('connecting');
-
-  ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws/phase1');
-  ws.binaryType = 'arraybuffer';
-
-  ws.onopen = () => {
-    mark('wsOpen');
-    ws.send(JSON.stringify({ type: 'start', codec: 'pcm16le', sampleRate: 16000 }));
-    micCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
-    source = micCtx.createMediaStreamSource(stream);
-    processor = micCtx.createScriptProcessor(4096, 1, 1);
-    processor.onaudioprocess = (event) => {
-      if (!ws || ws.readyState !== 1) return;
-      const input = event.inputBuffer.getChannelData(0);
-      const pcm = floatTo16BitPCM(input);
-      if (!canSendAudio) {
-        pcmPrebuffer.push(pcm);
-        if (pcmPrebuffer.length > MAX_PREBUFFER_CHUNKS) pcmPrebuffer.shift();
-        return;
-      }
-      ws.send(pcm);
-    };
-    source.connect(processor);
-    processor.connect(micCtx.destination);
-    setState('warming');
-  };
-
-  ws.onmessage = (evt) => {
-    const msg = JSON.parse(evt.data);
-    if (msg.type === 'ready') {
-      if (!canSendAudio) {
-        canSendAudio = true;
-        for (const pcm of pcmPrebuffer) { if (ws && ws.readyState === 1) ws.send(pcm); }
-        pcmPrebuffer = [];
-      }
-      setState('streaming');
-    }
-    if (msg.type === 'final') {
-      const t = Number(msg.turnId || (activeTurnId + 1));
-      if (t !== activeTurnId) {
-        activeTurnId = t;
-        resetMarks();
-      }
-      mark('finalAsr');
-      asrEl.textContent = msg.text || '';
-      setState('thinking');
-      currentReply = '';
-      resetPlayer();
-    }
-    if (msg.type === 'reply_text') {
-      if (msg.turnId && Number(msg.turnId) !== activeTurnId) return;
-      if (!marks.firstReplyText) mark('firstReplyText');
-      currentReply += msg.text || '';
-      replyEl.textContent = currentReply;
-    }
-    if (msg.type === 'audio_chunk' && msg.audioChunk) {
-      if (msg.turnId && Number(msg.turnId) !== activeTurnId) return;
-      if (!marks.firstAudioChunk) mark('firstAudioChunk');
-      enqueueChunk(msg.audioChunk, Number(msg.turnId || activeTurnId));
-      setState('speaking');
-    }
-    if (msg.type === 'reply_done') {
-      if (msg.turnId && Number(msg.turnId) !== activeTurnId) return;
-      mark('replyDone');
-      renderDebug(msg.metrics || undefined);
-      setState('streaming');
-    }
-    if (msg.type === 'error') {
-      replyEl.textContent = '错误：' + (msg.error || 'unknown');
-      disconnect();
-    }
-  };
-
-  ws.onerror = (e) => {
-    replyEl.textContent = 'WS连接失败（可能网络/证书/代理问题）';
-  };
-
-  ws.onclose = () => { if (connected) disconnect(); };
-}
-
-function disconnect(){
-  if (!connected) return;
-  connected = false;
-  try { if (processor) processor.disconnect(); } catch {}
-  try { if (source) source.disconnect(); } catch {}
-  try { if (micCtx) micCtx.close(); } catch {}
-  try { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'stop' })); } catch {}
-  try { if (ws) ws.close(); } catch {}
-  try { if (stream) stream.getTracks().forEach(t => t.stop()); } catch {}
-  btn.textContent = '连接并开始对话';
-  btn.classList.remove('off');
-  setState('idle');
-  renderDebug();
-}
-
-btn.addEventListener('click', () => {
-  if (connected) disconnect();
-  else connectAndTalk().catch((e) => { replyEl.textContent = '连接失败：' + (e?.message || e); disconnect(); });
-});
-</script></body></html>`;
-
 // ============ HTTP 服务器 ============
 const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && req.url === '/') {
@@ -1705,31 +885,6 @@ const server = http.createServer(async (req, res) => {
     res.end(phase1Page);
     return;
   }
-  if (req.method === 'GET' && (req.url === '/phase18' || req.url === '/phase1.8' || req.url === '/face1.8')) {
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(phase18Page);
-    return;
-  }
-  if (req.method === 'GET' && (req.url === '/phase19' || req.url === '/phase1.9' || req.url === '/face1.9')) {
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(phase19Page);
-    return;
-  }
-  if (req.method === 'GET' && (req.url === '/phase191' || req.url === '/phase1.9.1' || req.url === '/face1.9.1')) {
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(phase191Page);
-    return;
-  }
-  if (req.method === 'GET' && (req.url === '/phase192' || req.url === '/phase1.9.2' || req.url === '/face1.9.2')) {
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(phase192Page);
-    return;
-  }
-  if (req.method === 'GET' && (req.url === '/phase193' || req.url === '/phase1.9.3' || req.url === '/face1.9.3')) {
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(phase192Page);
-    return;
-  }
   res.writeHead(404); res.end('not found');
 });
 
@@ -1739,7 +894,6 @@ const wss = new WebSocketServer({ server, path: '/ws/phase1' });
 wss.on('connection', (client) => {
   let asrSession: StreamingAsrSession | null = null;
   let stopped = false;
-  let turnCounter = 0;
 
   const send = (data: unknown) => {
     if (client.readyState === WebSocket.OPEN) client.send(JSON.stringify(data));
@@ -1752,7 +906,6 @@ wss.on('connection', (client) => {
         stopped = false;
         asrSession = new StreamingAsrSession(send, async (text) => {
           if (stopped) return;
-          const turnId = ++turnCounter;
           const asrDoneAt = Date.now();
           console.log('[TEST] final_received=', JSON.stringify({ text, at: asrDoneAt }));
 
@@ -1771,7 +924,7 @@ wss.on('connection', (client) => {
               // onToken: 流式显示
               (token) => {
                 console.log('[TEST] onToken:', JSON.stringify(token));
-                send({ type: 'reply_text', turnId, text: token });
+                send({ type: 'reply_text', text: token });
               },
               // onSentence: 句子缓冲触发 TTS
               (sentence) => {
@@ -1786,7 +939,7 @@ wss.on('connection', (client) => {
                       console.log('[TEST] first_audio_chunk_latency=', firstTtsAt - llmStartAt);
                     }
                     console.log('[TEST] audio_chunk size:', chunk.length);
-                    send({ type: 'audio_chunk', turnId, audioChunk: chunk.toString('base64') });
+                    send({ type: 'audio_chunk', audioChunk: chunk.toString('base64') });
                   }
                 ).then(() => {
                   console.log('[TEST] TTS done for sentence:', sentence.substring(0, 20));
@@ -1816,13 +969,8 @@ wss.on('connection', (client) => {
               e2eMs: llmDoneAt - asrDoneAt,
             }));
 
-            // 保存到历史记录
-            addToHistory(text, fullReply);
-            console.log('[TEST] history saved, rounds=', (chatHistory.length - 1) / 2);
-
             send({
               type: 'reply_done',
-              turnId,
               text: fullReply,
               metrics: {
                 llmMs: llmDoneAt - llmStartAt,
@@ -1833,7 +981,7 @@ wss.on('connection', (client) => {
 
           } catch (e: any) {
             console.error('[TEST] error:', e);
-            send({ type: 'error', turnId, error: e.message || String(e) });
+            send({ type: 'error', error: e.message || String(e) });
           }
         });
         asrSession.start();
