@@ -254,7 +254,7 @@ class TtsConnection {
   private sessionId: string;
   private ready = false;
   private pendingQueue: { text: string; onChunk: (chunk: Buffer) => void; onDone: () => void; onError: (e: Error) => void }[] = [];
-  private currentJob: { onChunk: (chunk: Buffer) => void; onDone: () => void; onError: (e: Error) => void } | null = null;
+  private currentJob: { text: string; onChunk: (chunk: Buffer) => void; onDone: () => void; onError: (e: Error) => void } | null = null;
   private audioBuffer: Buffer[] = [];
 
   constructor() {
@@ -296,12 +296,10 @@ class TtsConnection {
       console.log(`[TTS_CONN] msg type=${type} flag=${flag} event=${event} payloadLen=${payload.length}`);
 
       if (type === 9 && event === 50) {
-        // 服务端准备好，发送 session 建立
-        console.log('[TTS_CONN] sending session create');
-        this.ws?.send(this.makeEvent(100, this.sessionId, {
-          user: { uid: uuidv4() },
-          req_params: { speaker: 'zh_female_vv_uranus_bigtts', audio_params: { format: 'mp3', sample_rate: 24000 } },
-        }));
+        // 服务端准备好，等待processQueue来创建session（避免重复创建）
+        console.log('[TTS_CONN] server ready (50), waiting for job');
+        this.ready = true;
+        this.processQueue();
       } else if (type === 9 && event === 150) {
         // session 建立成功，发送文本和 finish
         console.log('[TTS_CONN] session ready, sending text');
@@ -371,13 +369,12 @@ class TtsConnection {
 
   private processQueue() {
     console.log(`[TTS_CONN] processQueue: ready=${this.ready}, currentJob=${!!this.currentJob}, queueLen=${this.pendingQueue.length}`);
-    if (this.currentJob || this.pendingQueue.length === 0) return;
+    if (!this.ready || this.currentJob || this.pendingQueue.length === 0) return;
     const job = this.pendingQueue.shift()!;
     console.log(`[TTS_CONN] starting synthesis: ${job.text.substring(0, 20)}`);
     this.currentJob = { text: job.text, onChunk: job.onChunk, onDone: job.onDone, onError: job.onError };
     // 每句新建 session（连接复用）
     this.sessionId = uuidv4();
-    this.ready = false;
     this.ws?.send(this.makeEvent(100, this.sessionId, {
       user: { uid: uuidv4() },
       req_params: { speaker: 'zh_female_vv_uranus_bigtts', audio_params: { format: 'mp3', sample_rate: 24000 } },
