@@ -188,16 +188,17 @@ class GatewayClient {
     this.ws.send(JSON.stringify(connectReq));
   }
 
-  async sendAgentMessage(message: string): Promise<string> {
+  async sendAgentMessage(message: string, agentId: string): Promise<string> {
     if (!this.ws) throw new Error('Not connected');
 
     const id = `req-${++this.reqId}`;
-    const sessionKey = `agent:${AGENT_ID}:web-${Date.now()}`;
+    const sessionKey = `agent:${agentId}:web-${Date.now()}`;
 
     const reqFrame = {
       type: 'req', id, method: 'agent',
       params: {
         message,
+        agentId,
         sessionKey,
         idempotencyKey: uuidv4(),
         deliver: false,
@@ -222,7 +223,7 @@ class GatewayClient {
 }
 
 // HTTP Server
-const server = createServer((req, res) => {
+const server = createServer(async (req, res) => {
   // CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -255,6 +256,53 @@ const server = createServer((req, res) => {
     return;
   }
 
+  // API: List agents
+  if (url === '/api/agents') {
+    const device = loadDeviceIdentity();
+    if (!device) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Device not paired' }));
+      return;
+    }
+
+    try {
+      const client = new GatewayClient(device);
+      await client.connect();
+
+      // Call agents.list method
+      const id = `req-${Date.now()}`;
+      const reqFrame = {
+        type: 'req', id, method: 'agents.list',
+        params: {},
+      };
+
+      const agents = await new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('Timeout')), 5000);
+
+        // Override connect response handler temporarily
+        const originalHandler = client['handleFrame'];
+        client['pendingResolves'].set(id, (frame: any) => {
+          clearTimeout(timeout);
+          if (frame.ok && frame.payload?.agents) {
+            resolve(frame.payload.agents);
+          } else {
+            reject(new Error(frame.error?.message || 'Failed to list agents'));
+          }
+        });
+
+        client['ws']?.send(JSON.stringify(reqFrame));
+      });
+
+      client.close();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ agents }));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: String(err) }));
+    }
+    return;
+  }
+
   // API: Send message (SSE stream)
   if (url === '/api/chat' && req.method === 'POST') {
     const device = loadDeviceIdentity();
@@ -268,10 +316,15 @@ const server = createServer((req, res) => {
     req.on('data', chunk => body += chunk);
     req.on('end', async () => {
       try {
-        const { message } = JSON.parse(body);
+        const { message, agentId } = JSON.parse(body);
         if (!message) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: 'Message required' }));
+          return;
+        }
+        if (!agentId) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'agentId required' }));
           return;
         }
 
@@ -285,7 +338,7 @@ const server = createServer((req, res) => {
         await client.connect();
 
         // Send message
-        await client.sendAgentMessage(message);
+        await client.sendAgentMessage(message, agentId);
 
         // Listen for events
         client.onEvent((event: unknown) => {

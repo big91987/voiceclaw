@@ -37,6 +37,7 @@
       background: #1a1a1a;
       border-radius: 8px;
       font-size: 13px;
+      flex-wrap: wrap;
     }
     .status-item {
       display: flex;
@@ -55,6 +56,31 @@
     @keyframes pulse {
       0%, 100% { opacity: 1; }
       50% { opacity: 0.5; }
+    }
+    .agent-selector {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-left: auto;
+    }
+    .agent-selector label {
+      color: #888;
+      font-size: 12px;
+    }
+    select {
+      padding: 6px 12px;
+      background: #252525;
+      border: 1px solid #333;
+      border-radius: 6px;
+      color: #e0e0e0;
+      font-size: 13px;
+      outline: none;
+    }
+    select:focus {
+      border-color: #00d4ff;
+    }
+    select:disabled {
+      opacity: 0.5;
     }
     .input-area {
       display: flex;
@@ -205,6 +231,12 @@
         <span class="status-dot" id="conn-dot"></span>
         <span id="conn-status">未连接</span>
       </div>
+      <div class="agent-selector">
+        <label>Agent:</label>
+        <select id="agent-select" disabled>
+          <option value="">加载中...</option>
+        </select>
+      </div>
     </div>
 
     <div class="input-area">
@@ -239,26 +271,59 @@
     const deviceStatus = document.getElementById('device-status');
     const connDot = document.getElementById('conn-dot');
     const connStatus = document.getElementById('conn-status');
+    const agentSelect = document.getElementById('agent-select');
 
     let isReady = false;
     let currentStreamingDiv = null;
+    let agents = [];
 
-    // Check device status
+    // Check device status and load agents
     async function checkStatus() {
       try {
+        // Check device
         const res = await fetch('/api/status');
         const data = await res.json();
 
-        if (data.hasDevice) {
-          deviceDot.className = 'status-dot ready';
-          deviceStatus.textContent = 'Device: ' + data.deviceId;
-          isReady = true;
-          enableInput();
-          addSystemMessage('设备已就绪，可以开始对话');
-        } else {
+        if (!data.hasDevice) {
           deviceDot.className = 'status-dot error';
           deviceStatus.textContent = 'Device: 未配对';
           addSystemMessage('设备未配对，请先运行配对命令');
+          return;
+        }
+
+        deviceDot.className = 'status-dot ready';
+        deviceStatus.textContent = 'Device: ' + data.deviceId;
+
+        // Load agents
+        try {
+          const agentsRes = await fetch('/api/agents');
+          const agentsData = await agentsRes.json();
+
+          if (agentsData.error) {
+            throw new Error(agentsData.error);
+          }
+
+          agents = agentsData.agents || [];
+          agentSelect.innerHTML = '';
+
+          if (agents.length === 0) {
+            agentSelect.innerHTML = '<option value="">无可用 agent</option>';
+          } else {
+            agents.forEach(agent => {
+              const option = document.createElement('option');
+              option.value = agent.id;
+              option.textContent = agent.id + (agent.isDefault ? ' (默认)' : '');
+              agentSelect.appendChild(option);
+            });
+            agentSelect.disabled = false;
+          }
+
+          isReady = true;
+          enableInput();
+          addSystemMessage(`设备已就绪，已加载 ${agents.length} 个 agent`);
+        } catch (err) {
+          agentSelect.innerHTML = '<option value="">加载失败</option>';
+          addSystemMessage('加载 agents 失败: ' + err.message);
         }
       } catch (err) {
         deviceDot.className = 'status-dot error';
@@ -270,6 +335,7 @@
     function enableInput() {
       messageInput.disabled = false;
       sendBtn.disabled = false;
+      agentSelect.disabled = false;
       messageInput.focus();
     }
 
@@ -314,7 +380,13 @@
 
     async function sendMessage() {
       const message = messageInput.value.trim();
+      const agentId = agentSelect.value;
+
       if (!message) return;
+      if (!agentId) {
+        alert('请选择一个 agent');
+        return;
+      }
 
       messageInput.value = '';
       addMessage('user', message);
@@ -322,12 +394,13 @@
       const assistantDiv = addMessage('assistant', '', true);
       connDot.className = 'status-dot pending';
       connStatus.textContent = '发送中...';
+      agentSelect.disabled = true;
 
       try {
         const response = await fetch('/api/chat', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ message }),
+          body: JSON.stringify({ message, agentId }),
         });
 
         if (!response.ok) {
@@ -358,6 +431,7 @@
               if (typing) typing.remove();
               currentStreamingDiv = null;
               connStatus.textContent = '已完成';
+              agentSelect.disabled = false;
               break;
             }
 
@@ -365,7 +439,6 @@
               const event = JSON.parse(data);
               logEvent(event);
 
-              // Handle chat events (Gateway uses 'chat' event name)
               if (event.event === 'chat') {
                 const payload = event.payload;
 
@@ -381,6 +454,7 @@
                   if (typing) typing.remove();
                   currentStreamingDiv = null;
                   connStatus.textContent = '已完成';
+                  agentSelect.disabled = false;
                 } else if (payload.state === 'error') {
                   const typing = document.getElementById('typing');
                   if (typing) typing.remove();
@@ -389,6 +463,7 @@
                   }
                   connStatus.textContent = '错误';
                   connDot.className = 'status-dot error';
+                  agentSelect.disabled = false;
                 }
               } else if (event.event === 'subagent_announce') {
                 const payload = event.payload;
@@ -413,6 +488,7 @@
         }
         connDot.className = 'status-dot error';
         connStatus.textContent = '失败';
+        agentSelect.disabled = false;
       }
     }
 
