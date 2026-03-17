@@ -13,6 +13,9 @@ export class AsrClient {
   public onPartialResult: AsrResultCallback | null = null;
   public onFinalResult: AsrResultCallback | null = null;
 
+  get isStarted(): boolean { return this.started; }
+  get isFinished(): boolean { return this.finished; }
+
   private makeHeader(type: number, flag: number, serialization: number, compression: number): Buffer {
     const h = Buffer.alloc(4);
     h[0] = (1 << 4) | 1; // protocol version 1, header size 4 bytes
@@ -83,45 +86,55 @@ export class AsrClient {
     return { type, flag, seq, errCode, payload: payload.toString('utf8') };
   }
 
-  startSession(): void {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.closeSession();
-    }
+  private onReadyCallback: (() => void) | null = null;
 
-    this.started = false;
-    this.finished = false;
-    this.nextSeq = 2;
+  startSession(): Promise<void> {
+    return new Promise((resolve, reject) => {
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        this.closeSession();
+      }
 
-    this.ws = new WebSocket('wss://openspeech.bytedance.com/api/v3/sauc/bigmodel', {
-      headers: {
-        'X-Api-App-Key': config.asrAppId,
-        'X-Api-Access-Key': config.asrApiKey,
-        'X-Api-Resource-Id': 'volc.bigasr.sauc.duration',
-        'X-Api-Connect-Id': uuidv4(),
-      },
-      skipUTF8Validation: true,
-    });
+      this.started = false;
+      this.finished = false;
+      this.nextSeq = 2;
+      this.onReadyCallback = resolve;
 
-    this.ws.on('open', () => {
-      console.log('[ASR] WebSocket connected');
-      const req = {
-        user: { uid: uuidv4() },
-        audio: {
-          format: 'pcm',
-          codec: 'raw',
-          rate: 16000,
-          bits: 16,
-          channel: 1,
-          language: 'zh-CN',
+      const ws = new WebSocket('wss://openspeech.bytedance.com/api/v3/sauc/bigmodel', {
+        headers: {
+          'X-Api-App-Key': config.asrAppId,
+          'X-Api-Access-Key': config.asrApiKey,
+          'X-Api-Resource-Id': 'volc.bigasr.sauc.duration',
+          'X-Api-Connect-Id': uuidv4(),
         },
-        request: {
-          model_name: 'bigmodel',
-          enable_itn: true,
-          enable_punc: true,
-        },
-      };
-      this.ws?.send(this.makeFullClientRequest(req));
-    });
+        skipUTF8Validation: true,
+      });
+      this.ws = ws;
+
+      const timeout = setTimeout(() => {
+        reject(new Error('ASR session timeout'));
+      }, 5000);
+
+      this.ws.on('open', () => {
+        console.log('[ASR] WebSocket connected');
+        const req = {
+          user: { uid: uuidv4() },
+          audio: {
+            format: 'pcm',
+            codec: 'raw',
+            rate: 16000,
+            bits: 16,
+            channel: 1,
+            language: 'zh-CN',
+          },
+          request: {
+            model_name: 'bigmodel',
+            enable_itn: true,
+            enable_punc: true,
+            result_mode: 'utterance',
+          },
+        };
+        this.ws?.send(this.makeFullClientRequest(req));
+      });
 
     this.ws.on('message', (raw) => {
       const msg = this.parseMessage(Buffer.from(raw as Buffer));
@@ -141,20 +154,25 @@ export class AsrClient {
           if (!this.started) {
             this.started = true;
             console.log('[ASR] session ready');
+            clearTimeout(timeout);
+            this.onReadyCallback?.();
+            this.onReadyCallback = null;
             return;
           }
 
           if (text) {
             if (definite || msg.flag === 0b0011) {
+              console.log(`[ASR] 🎯 FINAL result: "${text}"`);
               this.onFinalResult?.(text, true);
             } else {
+              console.log(`[ASR] 📝 PARTIAL result: "${text}"`);
               this.onPartialResult?.(text, false);
             }
           }
 
           if (msg.flag === 0b0011) {
             this.finished = true;
-            console.log('[ASR] final result:', text);
+            console.log('[ASR] ✅ finished=true, session ended');
           }
         } catch {
           // ignore malformed JSON payloads
@@ -167,13 +185,52 @@ export class AsrClient {
     });
 
     this.ws.on('close', () => {
-      console.log('[ASR] WebSocket closed');
-      this.started = false;
+      // Only reset state if this is the CURRENT websocket (not an old one that closed late)
+      if (this.ws === ws) {
+        console.log('[ASR] WebSocket closed (current)');
+        this.started = false;
+      } else {
+        console.log('[ASR] WebSocket closed (old/stale, ignored)');
+      }
     });
+  }); // Promise闭合
   }
 
+  private frameCount = 0;
+  private lastLogTime = 0;
   sendAudio(pcm: Buffer): void {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.started || this.finished) return;
+    const now = Date.now();
+    const shouldLog = now - this.lastLogTime > 500; // 每500ms最多log一次
+
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      if (shouldLog) {
+        console.log(`[ASR] ❌ REJECTED: WebSocket not open (state=${this.ws?.readyState})`);
+        this.lastLogTime = now;
+      }
+      this.frameCount++;
+      return;
+    }
+    if (!this.started) {
+      if (shouldLog) {
+        console.log(`[ASR] ❌ REJECTED: not started (started=${this.started}, finished=${this.finished})`);
+        this.lastLogTime = now;
+      }
+      this.frameCount++;
+      return;
+    }
+    if (this.finished) {
+      if (shouldLog) {
+        console.log(`[ASR] ❌ REJECTED: already finished (started=${this.started}, finished=${this.finished})`);
+        this.lastLogTime = now;
+      }
+      this.frameCount++;
+      return;
+    }
+    this.frameCount++;
+    if (shouldLog) {
+      console.log(`[ASR] ✅ ACCEPTED frame #${this.frameCount} (size=${pcm.length}, started=${this.started}, finished=${this.finished})`);
+      this.lastLogTime = now;
+    }
     this.ws.send(this.makeAudioPacket(pcm, false));
   }
 
@@ -181,6 +238,11 @@ export class AsrClient {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.started || this.finished) return;
     this.ws.send(this.makeAudioPacket(Buffer.alloc(0), true));
     console.log('[ASR] sent final audio packet');
+  }
+
+  resetFinished(): void {
+    console.log('[ASR] 重置 finished 标志，准备下一轮识别');
+    this.finished = false;
   }
 
   closeSession(): void {
