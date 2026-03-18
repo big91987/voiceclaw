@@ -1,53 +1,13 @@
 import http from 'http';
-import fs from 'fs';
-import os from 'os';
-import path from 'path';
-import { spawn, execFile } from 'child_process';
-import { promisify } from 'util';
 import { gzipSync, gunzipSync } from 'zlib';
 import WebSocket, { WebSocketServer } from 'ws';
 import { v4 as uuidv4 } from 'uuid';
 import fetch from 'node-fetch';
 import { config } from './config';
 
-const kimiApiKey = 'sk-Oupbr9HRt6FUn2AAkzyntx7UR0BoDuudWQM0fTi1AOi9nanP';
-const kimiBaseUrl = 'https://api.moonshot.cn';
-const execFileAsync = promisify(execFile);
-
-// ============ 多轮对话历史 ============
-const MAX_HISTORY_ROUNDS = 100;
-interface ChatMessage { role: 'system' | 'user' | 'assistant'; content: string; }
-const chatHistory: ChatMessage[] = [
-  { role: 'system', content: '你是一个语音对话测试助手。回复简短自然，像跟人说话，不要太长。' }
-];
-
-function addToHistory(userMsg: string, assistantMsg: string) {
-  chatHistory.push({ role: 'user', content: userMsg });
-  chatHistory.push({ role: 'assistant', content: assistantMsg });
-  // 保留system消息 + 最多MAX_HISTORY_ROUNDS轮对话（每轮2条）
-  const maxMessages = 1 + MAX_HISTORY_ROUNDS * 2;
-  while (chatHistory.length > maxMessages) {
-    // 删除最早的一对对话（保留system）
-    chatHistory.splice(1, 2);
-  }
-}
-
-function getHistoryForApi(): ChatMessage[] {
-  return [...chatHistory];
-}
-
 function json(res: http.ServerResponse, code: number, data: unknown) {
   res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify(data));
-}
-
-function readBody(req: http.IncomingMessage): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    req.on('data', (c) => chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)));
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', reject);
-  });
 }
 
 function asrHeader(type: number, flag: number, serialization: number, compression: number) {
@@ -103,9 +63,9 @@ function parseAsr(buf: Buffer) {
 // ============ 句子缓冲：流式切分 LLM 输出 ============
 class SentenceBuffer {
   private buffer = '';
-  private minLength = 1;  // 降低为1，短句子也能触发
-  private maxLength = 40;
-  private flushTimeout = 100;  // 加快flush
+  private minLength = 8;   // 1.9.3: 增加最小长度，累积更多再触发
+  private maxLength = 60;  // 1.9.3: 增加最大长度
+  private flushTimeout = 200;  // 1.9.3: 增加超时，等待更多内容
   private timer: NodeJS.Timeout | null = null;
   private onSentence: (text: string) => void;
 
@@ -129,9 +89,9 @@ class SentenceBuffer {
       }
     }
 
-    // 检查是否有完整句子（有标点且超过最小长度）
-    const endPunct = /[。！？.!?]/;
-    const match = this.buffer.match(new RegExp(`^[\\s\\S]{${this.minLength},}?[${endPunct.source}]`));
+    // 检查是否有标点，不管长度立即触发
+    const anyPunct = /[。！？.!?，,；;]/;
+    const match = this.buffer.match(new RegExp(`^[\\s\\S]+?[${anyPunct.source}]`));
     if (match) {
       this.flushAt(match[0].length);
     }
@@ -181,89 +141,211 @@ class SentenceBuffer {
   }
 }
 
-// ============ 流式 LLM：边生成边送句子缓冲 ============
-async function streamChatWithKimi(
+
+async function streamChatWithOpenClaw(
   text: string,
+  opts: { gatewayUrl: string; gatewayToken?: string; model?: string; tag?: string },
   onToken: (token: string) => void,
   onSentence: (sentence: string) => void
 ): Promise<string> {
-  console.log('[TEST] kimi stream input=', JSON.stringify(text));
   const sentenceBuffer = new SentenceBuffer(onSentence);
+  const gatewayBase = (opts.gatewayUrl || 'http://127.0.0.1:18789').replace(/\/$/, '');
+  const model = opts.model || 'openai-codex/gpt-5.3-codex';
 
-  try {
-    const response = await fetch(`${kimiBaseUrl}/v1/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'authorization': `Bearer ${kimiApiKey}`,
-        'content-type': 'application/json',
+  const body: any = {
+    model,
+    stream: true,
+    messages: [
+      {
+        role: 'user',
+        content: opts.tag ? `[tag:${opts.tag}] ${text}` : text,
       },
-      body: JSON.stringify({
-        model: 'kimi-k2-turbo-preview',
-        max_tokens: 256,
-        stream: true,
-        messages: [...getHistoryForApi(), { role: 'user', content: text }],
-      }),
+    ],
+    metadata: opts.tag ? { tag: opts.tag } : undefined,
+  };
+
+  const headers: Record<string, string> = {
+    'content-type': 'application/json',
+  };
+  if (opts.gatewayToken) headers.authorization = `Bearer ${opts.gatewayToken}`;
+
+  const response = await fetch(`${gatewayBase}/v1/chat/completions`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok || !response.body) {
+    const errText = await response.text().catch(() => '');
+    throw new Error(`Gateway HTTP ${response.status}: ${errText.slice(0, 200)}`);
+  }
+
+  const bodyStream = response.body as unknown as NodeJS.ReadableStream;
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let fullReply = '';
+
+  return new Promise((resolve, reject) => {
+    bodyStream.on('data', (chunk: Buffer) => {
+      buffer += decoder.decode(chunk, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+      for (const line of lines) {
+        if (!line.trim() || !line.startsWith('data: ')) continue;
+        const data = line.slice(6);
+        if (data === '[DONE]') continue;
+        try {
+          const parsed = JSON.parse(data);
+          const content = parsed?.choices?.[0]?.delta?.content;
+          if (content) {
+            fullReply += content;
+            onToken(content);
+            sentenceBuffer.push(content);
+          }
+        } catch {
+          // ignore parse failures for non-data lines
+        }
+      }
     });
+    bodyStream.on('end', () => {
+      sentenceBuffer.flush();
+      resolve(fullReply);
+    });
+    bodyStream.on('error', reject);
+  });
+}
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error('[TEST] Kimi API error:', response.status, errorText.substring(0, 500));
-      throw new Error(`HTTP ${response.status}: ${errorText.substring(0, 200)}`);
+async function streamChatViaTestServer(
+  text: string,
+  opts: { proxyBase?: string; agentId?: string; reuseSession?: boolean },
+  onToken: (token: string) => void,
+  onSentence: (sentence: string) => void,
+  onMetric?: (metric: { metric: string; at?: number; ms?: number }) => void
+): Promise<string> {
+  const sentenceBuffer = new SentenceBuffer(onSentence);
+  const proxyBase = (opts.proxyBase || 'http://127.0.0.1:3456').replace(/\/$/, '');
+  const agentId = opts.agentId || 'voice';
+
+  const response = await fetch(`${proxyBase}/api/chat`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ message: text, agentId, reuseSession: !!opts.reuseSession }),
+  });
+
+  if (!response.ok || !response.body) {
+    const errText = await response.text().catch(() => '');
+    throw new Error(`Proxy HTTP ${response.status}: ${errText.slice(0, 200)}`);
+  }
+
+  const bodyStream = response.body as unknown as NodeJS.ReadableStream;
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let fullReply = '';
+  let gotFirstToken = false;
+  let firstTokenTimer: NodeJS.Timeout | null = null;
+  let renderedReply = '';
+
+  const emitDelta = (delta: string) => {
+    if (!delta) return;
+    if (!gotFirstToken) {
+      gotFirstToken = true;
+      if (firstTokenTimer) {
+        clearTimeout(firstTokenTimer);
+        firstTokenTimer = null;
+      }
     }
-    if (!response.body) {
-      throw new Error('No response body');
+    fullReply += delta;
+    onToken(delta);
+    sentenceBuffer.push(delta);
+  };
+
+  const applyFullText = (nextText: string) => {
+    if (!nextText) return;
+    if (nextText === renderedReply) return;
+    if (nextText.startsWith(renderedReply)) {
+      const delta = nextText.slice(renderedReply.length);
+      renderedReply = nextText;
+      emitDelta(delta);
+      return;
+    }
+    if (renderedReply.startsWith(nextText)) {
+      return;
+    }
+    renderedReply = nextText;
+    emitDelta(nextText);
+  };
+
+  const extractAssistantText = (parsed: any): string => {
+    if (!parsed?.payload || typeof parsed.payload !== 'object') return '';
+    const payload = parsed.payload;
+
+    if (payload?.stream === 'assistant') {
+      const data = payload?.data || {};
+      if (typeof data.text === 'string' && data.text) return data.text;
+      if (typeof data.delta === 'string' && data.delta) {
+        return renderedReply + data.delta;
+      }
+      return '';
     }
 
-    // node-fetch 返回的是 Node.js ReadableStream，需要适配
-    const body = response.body as unknown as NodeJS.ReadableStream;
-    const decoder = new TextDecoder();
-    let buffer = '';
-    let fullReply = '';
+    if (parsed?.event === 'chat' && payload?.message?.role === 'assistant') {
+      const content = payload?.message?.content;
+      if (typeof content === 'string') return content;
+      if (Array.isArray(content)) {
+        return content
+          .map((item: any) => {
+            if (typeof item === 'string') return item;
+            if (item?.type === 'text' && typeof item?.text === 'string') return item.text;
+            return '';
+          })
+          .join('');
+      }
+      if (typeof payload?.message?.text === 'string') return payload.message.text;
+    }
 
-    return new Promise((resolve, reject) => {
-      body.on('data', (chunk: Buffer) => {
-        console.log('[TEST] LLM data chunk received, size:', chunk.length);
-        buffer += decoder.decode(chunk, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
+    return '';
+  };
 
-        for (const line of lines) {
-          if (!line.trim() || !line.startsWith('data: ')) continue;
-          const data = line.slice(6);
-          if (data === '[DONE]') {
-            console.log('[TEST] LLM stream [DONE] received');
+  return new Promise((resolve, reject) => {
+    firstTokenTimer = setTimeout(() => {
+      reject(new Error('Proxy stream timeout: no first token'));
+    }, 10000);
+
+    bodyStream.on('data', (chunk: Buffer) => {
+      buffer += decoder.decode(chunk, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+      for (const line of lines) {
+        if (!line.trim() || !line.startsWith('data: ')) continue;
+        const data = line.slice(6);
+        if (data === '[DONE]') continue;
+        if (data === '[TIMEOUT]') {
+          reject(new Error('Proxy timeout'));
+          return;
+        }
+        try {
+          const parsed = JSON.parse(data);
+          if (parsed?.type === 'metric' && typeof parsed?.metric === 'string') {
+            onMetric?.({ metric: parsed.metric, at: parsed.at, ms: parsed.ms });
             continue;
           }
-          try {
-            const parsed = JSON.parse(data);
-            const content = parsed.choices?.[0]?.delta?.content;
-            if (content) {
-              fullReply += content;
-              onToken(content);
-              sentenceBuffer.push(content);
-            }
-          } catch (e) {
-            console.error('[TEST] Failed to parse LLM data:', data.substring(0, 100));
-          }
+          const assistantText = extractAssistantText(parsed);
+          applyFullText(assistantText);
+        } catch {
+          // ignore parse failures for non-data lines
         }
-      });
-
-      body.on('end', () => {
-        console.log('[TEST] LLM stream end, total length:', fullReply.length);
-        sentenceBuffer.flush();
-        resolve(fullReply);
-      });
-
-      body.on('error', (err) => {
-        console.error('[TEST] LLM stream error:', err);
-        reject(err);
-      });
+      }
     });
-
-  } catch (e: any) {
-    console.error('[TEST] kimi stream error:', e);
-    throw e;
-  }
+    bodyStream.on('end', () => {
+      if (firstTokenTimer) clearTimeout(firstTokenTimer);
+      sentenceBuffer.flush();
+      resolve(fullReply);
+    });
+    bodyStream.on('error', (err) => {
+      if (firstTokenTimer) clearTimeout(firstTokenTimer);
+      reject(err);
+    });
+  });
 }
 
 // ============ TTS：真流式，边合成边返回音频块 ============
@@ -275,6 +357,7 @@ class TtsConnection {
   private pendingQueue: { text: string; onChunk: (chunk: Buffer) => void; onDone: () => void; onError: (e: Error) => void }[] = [];
   private currentJob: { text: string; onChunk: (chunk: Buffer) => void; onDone: () => void; onError: (e: Error) => void } | null = null;
   private audioBuffer: Buffer[] = [];
+  private closingHandled = false;
 
   constructor() {
     this.sessionId = uuidv4();
@@ -282,6 +365,7 @@ class TtsConnection {
   }
 
   private connect() {
+    this.closingHandled = false;
     this.ws = new WebSocket('wss://openspeech.bytedance.com/api/v3/tts/bidirection', {
       headers: {
         'X-Api-App-Key': config.ttsAppId,
@@ -352,15 +436,25 @@ class TtsConnection {
 
     this.ws.on('error', (err) => {
       console.error('[TTS_CONN] WebSocket error:', err);
-      this.currentJob?.onError(err as Error);
-      this.currentJob = null;
+      this.failCurrentJob(err as Error);
     });
 
     this.ws.on('close', () => {
       console.log('[TTS_CONN] WebSocket closed, reconnecting...');
       this.ready = false;
+      this.failCurrentJob(new Error('TTS socket closed'));
       setTimeout(() => this.connect(), 1000);
     });
+  }
+
+  private failCurrentJob(err: Error) {
+    if (this.closingHandled) return;
+    this.closingHandled = true;
+    const job = this.currentJob;
+    this.currentJob = null;
+    if (job) {
+      job.onError(err);
+    }
   }
 
   private makeEvent(event: number, sessionId: string | null, payload: object) {
@@ -427,14 +521,17 @@ class TtsConnection {
   }
 }
 
-// 全局 TTS 连接
-const globalTtsConn = new TtsConnection();
+// 全局 TTS 连接（懒初始化，避免空闲时不断重连）
+let globalTtsConn: TtsConnection | null = null;
 
 async function streamTTS(
   text: string,
   onAudioChunk: (chunk: Buffer) => void
 ): Promise<void> {
   console.log('[TEST] streamTTS:', text.substring(0, 30));
+  if (!globalTtsConn) {
+    globalTtsConn = new TtsConnection();
+  }
   return globalTtsConn.synthesize(text, onAudioChunk);
 }
 
@@ -444,17 +541,39 @@ class StreamingAsrSession {
   private nextSeq = 2;
   private ready = false;
   private closed = false;
+  private reconnectScheduled = false;
+  private reconnectTimer: NodeJS.Timeout | null = null;
+  private connectAttempts = 0;
+  private readonly maxConnectAttempts = 6;
   private runningReply = false;
   private processedUtteranceIds = new Set<string>();
   private currentTurnText = '';
   private lastProcessedText = ''; // 跟踪上一轮处理过的文本，用于过滤累积
+  private lastUtteranceCount = 0; // 用于检测新语音（打断）
+  private bargeInSent = false; // 本轮是否已发送打断
 
   constructor(
     private sendEvent: (data: unknown) => void,
     private onFinal: (text: string) => Promise<void>,
+    private onBargeIn?: () => void, // 打断回调
   ) {}
 
   start() {
+    this.closed = false;
+    this.ready = false;
+    this.nextSeq = 2;
+    this.connectAttempts = 0;
+    this.openSocket();
+  }
+
+  private openSocket() {
+    if (this.closed) return;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.reconnectScheduled = false;
+
     // 使用双向流式优化版，支持二遍识别+VAD分句
     this.ws = new WebSocket('wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async', {
       headers: {
@@ -467,6 +586,7 @@ class StreamingAsrSession {
     });
 
     this.ws.on('open', () => {
+      this.connectAttempts = 0;
       this.ws?.send(asrFullClientRequest({
         user: { uid: uuidv4() },
         audio: { format: 'pcm', codec: 'raw', rate: 16000, bits: 16, channel: 1, language: 'zh-CN' },
@@ -535,6 +655,15 @@ class StreamingAsrSession {
           this.sendEvent({ type: 'partial', text: displayText, hasDefinite });
         }
 
+        // 打断检测：仅在启用 onBargeIn 时生效，避免默认场景误打断
+        if (this.onBargeIn && utterances.length > this.lastUtteranceCount && this.runningReply && !this.bargeInSent) {
+          console.log('[ASR] barge-in detected, new utterances:', utterances.length - this.lastUtteranceCount);
+          this.bargeInSent = true;
+          this.sendEvent({ type: 'barge_in' });
+          this.onBargeIn?.();
+        }
+        this.lastUtteranceCount = utterances.length;
+
         // 处理 definite=true 的utterance（二遍识别完成，最终结果）
         if (hasDefinite && !this.runningReply) {
           // 找到尚未处理的 definite utterance
@@ -572,6 +701,8 @@ class StreamingAsrSession {
             this.processReply(finalText).finally(() => {
               this.runningReply = false;
               this.currentTurnText = '';
+              this.bargeInSent = false; // 重置打断状态
+              // 注意：不要重置 lastUtteranceCount，ASR连接是持续的
             });
           }
         }
@@ -581,13 +712,34 @@ class StreamingAsrSession {
     });
 
     this.ws.on('close', () => {
-      this.closed = true;
+      if (!this.closed && !this.ready) {
+        this.scheduleReconnect('ASR ws closed before ready');
+        return;
+      }
       this.sendEvent({ type: 'closed' });
     });
 
     this.ws.on('error', (err) => {
-      this.sendEvent({ type: 'error', error: err.message });
+      const message = err?.message || String(err);
+      if (!this.closed && !this.ready) {
+        this.scheduleReconnect(`ASR ws error: ${message}`);
+        return;
+      }
+      this.sendEvent({ type: 'error', error: message });
     });
+  }
+
+  private scheduleReconnect(reason: string) {
+    if (this.closed || this.reconnectScheduled) return;
+    this.connectAttempts += 1;
+    if (this.connectAttempts >= this.maxConnectAttempts) {
+      this.sendEvent({ type: 'error', error: `${reason} (retry exhausted)` });
+      return;
+    }
+    this.reconnectScheduled = true;
+    const delayMs = Math.min(800 * this.connectAttempts, 3000);
+    console.log(`[ASR] reconnect in ${delayMs}ms, attempt=${this.connectAttempts}, reason=${reason}`);
+    this.reconnectTimer = setTimeout(() => this.openSocket(), delayMs);
   }
 
   private async processReply(text: string) {
@@ -614,6 +766,10 @@ class StreamingAsrSession {
 
   close() {
     this.closed = true;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     if (this.ws) {
       this.ws.close();
       this.ws = null;
@@ -621,333 +777,68 @@ class StreamingAsrSession {
   }
 }
 
-// ============ 前端页面 ============
-const page = `<!doctype html>
+const lobsterHalfDuplexPage = `<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>VoiceClaw 单工测试页</title>
+<title>龙虾半双工语音对话</title>
 <style>
-body{font-family:system-ui;padding:24px;max-width:780px;margin:auto;background:#0b1020;color:#e8ecff}button{padding:12px 18px;border-radius:12px;border:none;background:#5b7cff;color:white;font-size:16px;cursor:pointer;margin-right:8px}button[disabled]{opacity:.5} .card{background:#121933;padding:16px;border-radius:16px;margin-top:16px} .mono{white-space:pre-wrap;font-family:ui-monospace,monospace} a{color:#9bb0ff}
+body{font-family:system-ui;padding:24px;max-width:980px;margin:auto;background:#0a1226;color:#e8ecff}
+button{padding:12px 18px;border-radius:12px;border:none;background:#4e8cff;color:white;font-size:16px;cursor:pointer}
+button.off{background:#de4f5f}
+input{padding:8px 10px;border-radius:8px;border:1px solid #2f3a63;background:#101a37;color:#e8ecff;width:100%;margin-top:6px}
+input[type="checkbox"]{width:auto;margin-top:0}
+.card{background:#121f42;padding:14px;border-radius:14px;margin-top:14px}
+.mono{white-space:pre-wrap;font-family:ui-monospace,monospace}
+.state{display:inline-block;padding:6px 10px;border-radius:999px;background:#213160;margin-left:8px}
+.ok{background:#1f6f43}.bad{background:#8f2b2b}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.hint{opacity:.86;font-size:14px}
+.checkline{display:flex;align-items:center;gap:8px;margin-top:10px}
 </style></head><body>
-<h1>VoiceClaw 单工 / 对讲机测试页</h1>
-<p>当前模式：<b>单工</b>。先录音，再识别，再回复，再播语音。</p>
-<p><a href="/phase1">进入：流式 ASR Phase 1 调试页</a></p>
-<div>
-<button id="startBtn">开始录音</button>
-<button id="stopBtn" disabled>停止并发送</button>
-</div>
-<div class="card"><b>识别：</b><div id="asr" class="mono"></div></div>
-<div class="card"><b>回复：</b><div id="reply" class="mono"></div></div>
-<audio id="player" controls style="width:100%;margin-top:16px"></audio>
-<script>
-const startBtn = document.getElementById('startBtn');
-const stopBtn = document.getElementById('stopBtn');
-const asr = document.getElementById('asr');
-const reply = document.getElementById('reply');
-const player = document.getElementById('player');
-let mediaRecorder, stream, chunks=[];
-async function startRec(){
-  stream = await navigator.mediaDevices.getUserMedia({audio:true});
-  const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' : 'audio/webm';
-  mediaRecorder = new MediaRecorder(stream, {mimeType});
-  chunks=[];
-  mediaRecorder.ondataavailable = e => { if(e.data && e.data.size) chunks.push(e.data); };
-  mediaRecorder.onstop = async ()=>{
-    startBtn.disabled=false; stopBtn.disabled=true;
-    const blob = new Blob(chunks,{type:mimeType});
-    const fd = new FormData(); fd.append('audio', blob, 'recording.webm');
-    asr.textContent='识别中...'; reply.textContent='';
-    const res = await fetch('/api/talk',{method:'POST',body:fd});
-    const data = await res.json();
-    asr.textContent = data.asr || '(空)';
-    reply.textContent = data.reply || '(空)';
-    if (data.audioBase64) {
-      player.src = 'data:audio/mpeg;base64,' + data.audioBase64;
-      player.play().catch(()=>{});
-    }
-    stream.getTracks().forEach(t=>t.stop());
-  };
-  mediaRecorder.start(250);
-  startBtn.disabled=true; stopBtn.disabled=false;
-};
-function stopRec(){ if(mediaRecorder && mediaRecorder.state!=='inactive') mediaRecorder.stop(); }
-startBtn.addEventListener('click', startRec);
-stopBtn.addEventListener('click', stopRec);
-</script></body></html>`;
-
-const phase1Page = `<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>VoiceClaw 流式 ASR Phase 1</title>
-<style>
-body{font-family:system-ui;padding:24px;max-width:920px;margin:auto;background:#0b1020;color:#e8ecff}button{padding:12px 18px;border-radius:12px;border:none;background:#5b7cff;color:white;font-size:16px;cursor:pointer;margin-right:8px}button[disabled]{opacity:.5}.card{background:#121933;padding:16px;border-radius:16px;margin-top:16px}.mono{white-space:pre-wrap;font-family:ui-monospace,monospace} .state{display:inline-block;padding:6px 10px;border-radius:999px;background:#1f2a57;margin-left:8px} a{color:#9bb0ff}.hint{opacity:.8;font-size:14px;margin-top:10px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.metric{font-family:ui-monospace,monospace;font-size:13px}
-</style></head><body>
-<h1>VoiceClaw 流式 ASR Phase 1 调试页</h1>
-<p>这版先打通：<b>浏览器持续采集</b> + <b>服务端 ASR 长连接 session</b>。</p>
-<p>当前录音格式改成 <b>PCM/16k mono</b>，重点看 turn 切分和各阶段耗时。</p>
-<p><a href="/">返回单工测试页</a></p>
-<div>
-<button id="startBtn">开始流式采集</button>
-<button id="stopBtn" disabled>结束本轮</button>
-<span class="state" id="state">idle</span>
-</div>
-<div class="hint">状态：idle → connecting → streaming → thinking → speaking。已加入前端 console 日志和时间戳统计。</div>
+<h1>龙虾半双工语音对话</h1>
+<p class="hint">链路：麦克风 -> 火山 ASR -> OpenClaw voice agent -> 火山 TTS。纯 proxy 模式，支持实时播放和打断。</p>
 <div class="grid">
-  <div class="card"><b>实时 partial：</b><div id="partial" class="mono"></div></div>
-  <div class="card"><b>final ASR：</b><div id="asr" class="mono"></div></div>
+  <div><label>Proxy URL（根目录 test-server）</label><input id="proxyBase" value="http://127.0.0.1:3456"></div>
+  <div><label>Agent ID</label><input id="agentId" value="voice"></div>
+  <div class="checkline"><input id="enableBargeIn" type="checkbox"><label for="enableBargeIn">启用 Barge-in 打断</label></div>
+  <div class="checkline"><input id="reuseSession" type="checkbox"><label for="reuseSession">复用 Session（保留上下文）</label></div>
 </div>
-<div class="card"><b>回复（流式）：</b><div id="reply" class="mono"></div></div>
-<div class="card"><b>阶段耗时：</b><div id="metrics" class="metric"></div></div>
-<audio id="player" controls style="width:100%;margin-top:16px"></audio>
-<script>
-const startBtn = document.getElementById('startBtn');
-const stopBtn = document.getElementById('stopBtn');
-const partialEl = document.getElementById('partial');
-const asrEl = document.getElementById('asr');
-const replyEl = document.getElementById('reply');
-const metricsEl = document.getElementById('metrics');
-const player = document.getElementById('player');
-const stateEl = document.getElementById('state');
-let stream, ws, audioCtx, source, processor;
-let turnStats = {};
-let turnIndex = 0;
-// MediaSource 用于流式音频播放
-let mediaSource, sourceBuffer;
-let audioQueue = [];
-let isAppending = false;
-let useMediaSource = false;
-let accumulatedAudio = ''; // 用于累积 base64 音频
-
-function now(){ return performance.now(); }
-function ts(){ return new Date().toLocaleTimeString('zh-CN', { hour12:false }) + '.' + String(Date.now()%1000).padStart(3,'0'); }
-function log(...args){ console.log('[voiceclaw phase1]', ts(), ...args); }
-function setState(s){ stateEl.textContent = s; log('state=', s); }
-function nextTurn(){ turnIndex += 1; turnStats = { turnIndex }; renderMetrics(); partialEl.textContent=''; asrEl.textContent=''; replyEl.textContent=''; accumulatedAudio=''; }
-function setMark(name){ turnStats[name] = now(); renderMetrics(); }
-function delta(a,b){ if(turnStats[a] == null || turnStats[b] == null) return '-'; return (turnStats[b]-turnStats[a]).toFixed(1) + 'ms'; }
-function renderMetrics(){
-  metricsEl.textContent = [
-    'turn: ' + (turnStats.turnIndex || 0),
-    'asrMs: ' + delta('capture_start','final_asr'),
-    'llmMs: ' + (turnStats.llmMs != null ? turnStats.llmMs.toFixed(1) + 'ms' : '-'),
-    'ttsMs: ' + (turnStats.ttsMs != null ? turnStats.ttsMs.toFixed(1) + 'ms' : '-'),
-    'e2eMs: ' + delta('final_asr','audio_play'),
-  ].join('\\n');
-}
-function resetTurnStats(){ turnStats = {}; renderMetrics(); }
-function floatTo16BitPCM(float32Array){
-  const buffer = new ArrayBuffer(float32Array.length * 2);
-  const view = new DataView(buffer);
-  let offset = 0;
-  for (let i = 0; i < float32Array.length; i++, offset += 2) {
-    let s = Math.max(-1, Math.min(1, float32Array[i]));
-    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
-  }
-  return buffer;
-}
-
-// MediaSource 流式音频播放
-function initMediaSource() {
-  useMediaSource = false;
-  accumulatedAudio = '';
-  // 暂时不使用 MediaSource，直接用 base64 播放更可靠
-  log('Using base64 audio playback (MediaSource disabled for reliability)');
-  return false;
-}
-
-function processAudioQueue() {
-  if (isAppending || !sourceBuffer || audioQueue.length === 0) return;
-  isAppending = true;
-  const chunk = audioQueue.shift();
-  try {
-    sourceBuffer.appendBuffer(chunk);
-  } catch (e) {
-    log('appendBuffer error:', e);
-    isAppending = false;
-  }
-}
-
-function queueAudioChunk(base64Data) {
-  // 累积 base64 音频
-  accumulatedAudio += base64Data;
-  log('Audio chunk received, total length:', accumulatedAudio.length);
-}
-
-function playAccumulatedAudio() {
-  if (!accumulatedAudio) {
-    log('No audio to play');
-    return;
-  }
-  log('Playing accumulated audio, length:', accumulatedAudio.length);
-  player.src = 'data:audio/mpeg;base64,' + accumulatedAudio;
-  player.play().then(() => {
-    log('Audio playback started');
-  }).catch((err) => {
-    log('Audio playback failed:', err);
-  });
-}
-
-async function startStreaming(){
-  nextTurn();
-  setMark('capture_start');
-  log('start streaming clicked');
-
-  // 初始化音频系统
-  initMediaSource();
-  accumulatedAudio = '';
-  player.src = '';
-
-  stream = await navigator.mediaDevices.getUserMedia({
-    audio: {
-      channelCount: 1,
-      sampleRate: 16000,
-      echoCancellation: true,
-      noiseSuppression: true,
-      autoGainControl: true,
-    }
-  });
-  log('getUserMedia ok');
-  ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws/phase1');
-  ws.binaryType = 'arraybuffer';
-  ws.onopen = async () => {
-    setMark('ws_open');
-    setState('connecting');
-    log('ws open, sending start');
-    ws.send(JSON.stringify({ type: 'start', codec: 'pcm16le', sampleRate: 16000 }));
-    audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
-    source = audioCtx.createMediaStreamSource(stream);
-    processor = audioCtx.createScriptProcessor(4096, 1, 1);
-    processor.onaudioprocess = (event) => {
-      if (!ws || ws.readyState !== 1) return;
-      const input = event.inputBuffer.getChannelData(0);
-      const pcm = floatTo16BitPCM(input);
-      ws.send(pcm);
-    };
-    source.connect(processor);
-    processor.connect(audioCtx.destination);
-    setState('streaming');
-    startBtn.disabled = true;
-    stopBtn.disabled = false;
-  };
-  ws.onmessage = (evt) => {
-    const msg = JSON.parse(evt.data);
-    log('ws message=', msg.type, msg);
-    if (msg.type === 'ready') setState('streaming');
-    if (msg.type === 'partial') {
-      partialEl.textContent = '[turn ' + turnIndex + '][' + ts() + '] ' + (msg.text || '');
-    }
-    if (msg.type === 'final') {
-      const finishedTurn = turnIndex;
-      setMark('final_asr');
-      asrEl.textContent = '[turn ' + finishedTurn + '][' + ts() + '] ' + (msg.text || '');
-      partialEl.textContent = '';
-      setState('thinking');
-    }
-    if (msg.type === 'reply_text') {
-      if (!turnStats.reply_start) setMark('reply_start');
-      replyEl.textContent += msg.text || '';
-    }
-    if (msg.type === 'audio_chunk') {
-      // 累积音频块
-      if (!turnStats.first_audio) {
-        setMark('first_audio');
-        setState('speaking');
-      }
-      if (msg.audioChunk) {
-        queueAudioChunk(msg.audioChunk);
-      }
-    }
-    if (msg.type === 'reply_done') {
-      setMark('reply_recv');
-      if (msg.metrics) {
-        if (typeof msg.metrics.llmMs === 'number') turnStats.llmMs = msg.metrics.llmMs;
-        if (typeof msg.metrics.ttsMs === 'number') turnStats.ttsMs = msg.metrics.ttsMs;
-      }
-      renderMetrics();
-      // 播放累积的音频
-      playAccumulatedAudio();
-      nextTurn();
-    }
-    if (msg.type === 'error') {
-      replyEl.textContent = '[' + ts() + '] 错误：' + msg.error;
-      setState('idle');
-    }
-  };
-  ws.onclose = () => { log('ws close'); setState('idle'); };
-}
-function stopStreaming(){
-  log('stop streaming clicked');
-  if (processor) processor.disconnect();
-  if (source) source.disconnect();
-  if (audioCtx) audioCtx.close();
-  if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'stop' }));
-  if (stream) stream.getTracks().forEach(t => t.stop());
-  startBtn.disabled = false;
-  stopBtn.disabled = true;
-}
-player.addEventListener('ended', () => { log('audio ended'); setState('idle'); });
-startBtn.addEventListener('click', startStreaming);
-stopBtn.addEventListener('click', stopStreaming);
-renderMetrics();
-</script></body></html>`;
-
-const phase18Page = `<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>VoiceClaw Phase 1.8</title>
-<style>
-body{font-family:system-ui;padding:24px;max-width:920px;margin:auto;background:#0b1020;color:#e8ecff}
-button{padding:12px 18px;border-radius:12px;border:none;background:#5b7cff;color:white;font-size:16px;cursor:pointer}
-button.off{background:#eb4d4b}
-.card{background:#121933;padding:16px;border-radius:16px;margin-top:16px}
-.mono{white-space:pre-wrap;font-family:ui-monospace,monospace}
-.state{display:inline-block;padding:6px 10px;border-radius:999px;background:#1f2a57;margin-left:8px}
-.hint{opacity:.8;font-size:14px;margin-top:10px}
-</style></head><body>
-<h1>VoiceClaw Phase 1.8（一键通话）</h1>
-<p>只保留一个按钮：<b>点一次连接并持续对话，再点一次断开连接</b>。</p>
-<p><a href="/phase1">返回 phase1 调试页</a></p>
-<div>
+<div style="margin-top:12px">
   <button id="toggleBtn">连接并开始对话</button>
   <span class="state" id="state">idle</span>
 </div>
-<div class="hint">连接后会持续采集麦克风并自动多轮对话；再次点击按钮立即断开。</div>
-<div class="card"><b>最新识别：</b><div id="asr" class="mono"></div></div>
-<div class="card"><b>助手回复：</b><div id="reply" class="mono"></div></div>
-<div class="card"><b>调试时间线：</b><div id="debug" class="mono"></div></div>
+<div class="card"><b>ASR（实时）</b><div id="asrPartial" class="mono"></div></div>
+<div class="card"><b>ASR（最终）</b><div id="asrFinal" class="mono"></div></div>
+<div class="card"><b>助手回复</b><div id="reply" class="mono"></div></div>
+<div class="card"><b>调试日志</b><div id="debug" class="mono"></div></div>
 <script>
 const btn = document.getElementById('toggleBtn');
 const stateEl = document.getElementById('state');
-const asrEl = document.getElementById('asr');
+const asrPartialEl = document.getElementById('asrPartial');
+const asrFinalEl = document.getElementById('asrFinal');
 const replyEl = document.getElementById('reply');
 const debugEl = document.getElementById('debug');
-let stream, ws, audioCtx, source, processor;
-let connected = false;
-let currentReply = '';
-let accumulatedAudio = '';
-const player = new Audio();
-let marks = {};
+const proxyBaseEl = document.getElementById('proxyBase');
+const agentIdEl = document.getElementById('agentId');
+const enableBargeInEl = document.getElementById('enableBargeIn');
+const reuseSessionEl = document.getElementById('reuseSession');
 
-function now(){ return performance.now(); }
-function fmt(ms){ return ms == null ? '-' : ms.toFixed(1) + 'ms'; }
-function mark(name){ marks[name] = now(); renderDebug(); }
-function resetMarks(){ marks = { turnStart: now() }; renderDebug(); }
-function renderDebug(serverMetrics){
-  const lines = [];
-  const delta = (a,b) => (marks[a] != null && marks[b] != null) ? (marks[b] - marks[a]) : null;
-  lines.push('ws_open=' + fmt(delta('turnStart','wsOpen')));
-  lines.push('asr=' + fmt(delta('turnStart','finalAsr')));
-  lines.push('llm首字=' + fmt(delta('finalAsr','firstReplyText')));
-  lines.push('首音频包=' + fmt(delta('finalAsr','firstAudioChunk')));
-  lines.push('回包完成=' + fmt(delta('finalAsr','replyDone')));
-  lines.push('开始播放=' + fmt(delta('finalAsr','audioPlayStart')));
-  if (serverMetrics) {
-    lines.push('--- server metrics ---');
-    lines.push('llmMs=' + fmt(serverMetrics.llmMs));
-    lines.push('ttsMs=' + fmt(serverMetrics.ttsMs));
-    lines.push('firstAudioLatency=' + fmt(serverMetrics.firstAudioLatency));
-  }
-  debugEl.textContent = lines.join('\\n');
-}
+let connected = false, stream, ws, micCtx, source, processor;
+let playCtx = null, nextPlayTime = 0, decodeChain = Promise.resolve(), playerGeneration = 0;
+let activeTurnId = 0;
 
 function setState(s){ stateEl.textContent = s; }
+function fmtMs(v){ return typeof v === 'number' ? v + 'ms' : '-'; }
+function fmtTs(v){
+  if (typeof v !== 'number') return '-';
+  return new Date(v).toLocaleTimeString('zh-CN', { hour12: false }) + '.' + String(v % 1000).padStart(3, '0');
+}
+function dlog(msg){
+  const t = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+  debugEl.textContent = '[' + t + '] ' + msg + '\\n' + (debugEl.textContent || '');
+}
+
+reuseSessionEl.checked = false;
+
 function floatTo16BitPCM(float32Array){
   const buffer = new ArrayBuffer(float32Array.length * 2);
   const view = new DataView(buffer);
@@ -957,719 +848,144 @@ function floatTo16BitPCM(float32Array){
     view.setInt16(offset, v < 0 ? v * 0x8000 : v * 0x7FFF, true);
   }
   return buffer;
-}
-
-function queueAudioChunk(base64Data){ accumulatedAudio += base64Data || ''; }
-function playAccumulatedAudio(){
-  if (!accumulatedAudio) return;
-  mark('audioPlayStart');
-  player.src = 'data:audio/mpeg;base64,' + accumulatedAudio;
-  player.play().catch(() => {});
-}
-
-async function connectAndTalk(){
-  if (connected) return;
-  resetMarks();
-  connected = true;
-  btn.textContent = '断开连接';
-  btn.classList.add('off');
-  setState('connecting');
-
-  stream = await navigator.mediaDevices.getUserMedia({
-    audio: { channelCount: 1, sampleRate: 16000, echoCancellation: true, noiseSuppression: true, autoGainControl: true }
-  });
-
-  ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws/phase1');
-  ws.binaryType = 'arraybuffer';
-
-  ws.onopen = () => {
-    mark('wsOpen');
-    ws.send(JSON.stringify({ type: 'start', codec: 'pcm16le', sampleRate: 16000 }));
-    audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
-    source = audioCtx.createMediaStreamSource(stream);
-    processor = audioCtx.createScriptProcessor(4096, 1, 1);
-    processor.onaudioprocess = (event) => {
-      if (!ws || ws.readyState !== 1) return;
-      const input = event.inputBuffer.getChannelData(0);
-      ws.send(floatTo16BitPCM(input));
-    };
-    source.connect(processor);
-    processor.connect(audioCtx.destination);
-    setState('streaming');
-  };
-
-  ws.onmessage = (evt) => {
-    const msg = JSON.parse(evt.data);
-    if (msg.type === 'final') {
-      mark('finalAsr');
-      asrEl.textContent = msg.text || '';
-      setState('thinking');
-      currentReply = '';
-      accumulatedAudio = '';
-    }
-    if (msg.type === 'reply_text') {
-      if (!marks.firstReplyText) mark('firstReplyText');
-      currentReply += msg.text || '';
-      replyEl.textContent = currentReply;
-    }
-    if (msg.type === 'audio_chunk' && msg.audioChunk) {
-      if (!marks.firstAudioChunk) mark('firstAudioChunk');
-      queueAudioChunk(msg.audioChunk);
-      setState('speaking');
-    }
-    if (msg.type === 'reply_done') {
-      mark('replyDone');
-      playAccumulatedAudio();
-      renderDebug(msg.metrics || undefined);
-      setState('streaming');
-    }
-    if (msg.type === 'error') {
-      replyEl.textContent = '错误：' + (msg.error || 'unknown');
-      disconnect();
-    }
-  };
-
-  ws.onclose = () => {
-    if (connected) disconnect();
-  };
-}
-
-function disconnect(){
-  if (!connected) return;
-  connected = false;
-  try { if (processor) processor.disconnect(); } catch {}
-  try { if (source) source.disconnect(); } catch {}
-  try { if (audioCtx) audioCtx.close(); } catch {}
-  try { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'stop' })); } catch {}
-  try { if (ws) ws.close(); } catch {}
-  try { if (stream) stream.getTracks().forEach(t => t.stop()); } catch {}
-  btn.textContent = '连接并开始对话';
-  btn.classList.remove('off');
-  setState('idle');
-  renderDebug();
-}
-
-btn.addEventListener('click', () => {
-  if (connected) disconnect(); else connectAndTalk().catch((e) => {
-    replyEl.textContent = '连接失败：' + (e?.message || e);
-    disconnect();
-  });
-});
-</script></body></html>`;
-
-const phase19Page = `<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>VoiceClaw Phase 1.9</title>
-<style>
-body{font-family:system-ui;padding:24px;max-width:920px;margin:auto;background:#0b1020;color:#e8ecff}
-button{padding:12px 18px;border-radius:12px;border:none;background:#5b7cff;color:white;font-size:16px;cursor:pointer}
-button.off{background:#eb4d4b}
-.card{background:#121933;padding:16px;border-radius:16px;margin-top:16px}
-.mono{white-space:pre-wrap;font-family:ui-monospace,monospace}
-.state{display:inline-block;padding:6px 10px;border-radius:999px;background:#1f2a57;margin-left:8px}
-.hint{opacity:.8;font-size:14px;margin-top:10px}
-</style></head><body>
-<h1>VoiceClaw Phase 1.9（流式播报）</h1>
-<p>一键连接持续对话 + <b>TTS 分片实时播放（边生成边播）</b>。</p>
-<p><a href="/phase18">返回 phase1.8</a></p>
-<div>
-  <button id="toggleBtn">连接并开始对话</button>
-  <span class="state" id="state">idle</span>
-</div>
-<div class="hint">连接后持续采集麦克风；再次点击断开。收到 audio_chunk 即刻排队播放。</div>
-<div class="card"><b>最新识别：</b><div id="asr" class="mono"></div></div>
-<div class="card"><b>助手回复：</b><div id="reply" class="mono"></div></div>
-<div class="card"><b>调试时间线：</b><div id="debug" class="mono"></div></div>
-<script>
-const btn = document.getElementById('toggleBtn');
-const stateEl = document.getElementById('state');
-const asrEl = document.getElementById('asr');
-const replyEl = document.getElementById('reply');
-const debugEl = document.getElementById('debug');
-let stream, ws, audioCtx, source, processor;
-let connected = false;
-let currentReply = '';
-let marks = {};
-
-// 流式音频分片播放队列（1.9核心）
-let chunkQueue = [];
-let chunkPlaying = false;
-
-function now(){ return performance.now(); }
-function fmt(ms){ return ms == null ? '-' : ms.toFixed(1) + 'ms'; }
-function mark(name){ marks[name] = now(); renderDebug(); }
-function resetMarks(){ marks = { turnStart: now() }; renderDebug(); }
-function renderDebug(serverMetrics){
-  const lines = [];
-  const delta = (a,b) => (marks[a] != null && marks[b] != null) ? (marks[b] - marks[a]) : null;
-  lines.push('ws_open=' + fmt(delta('turnStart','wsOpen')));
-  lines.push('asr=' + fmt(delta('turnStart','finalAsr')));
-  lines.push('llm首字=' + fmt(delta('finalAsr','firstReplyText')));
-  lines.push('首音频包=' + fmt(delta('finalAsr','firstAudioChunk')));
-  lines.push('开始播放=' + fmt(delta('finalAsr','audioPlayStart')));
-  lines.push('回包完成=' + fmt(delta('finalAsr','replyDone')));
-  if (serverMetrics) {
-    lines.push('--- server metrics ---');
-    lines.push('llmMs=' + fmt(serverMetrics.llmMs));
-    lines.push('ttsMs=' + fmt(serverMetrics.ttsMs));
-    lines.push('firstAudioLatency=' + fmt(serverMetrics.firstAudioLatency));
-  }
-  debugEl.textContent = lines.join('\\n');
-}
-
-function setState(s){ stateEl.textContent = s; }
-function floatTo16BitPCM(float32Array){
-  const buffer = new ArrayBuffer(float32Array.length * 2);
-  const view = new DataView(buffer);
-  let offset = 0;
-  for (let i = 0; i < float32Array.length; i++, offset += 2) {
-    let v = Math.max(-1, Math.min(1, float32Array[i]));
-    view.setInt16(offset, v < 0 ? v * 0x8000 : v * 0x7FFF, true);
-  }
-  return buffer;
-}
-
-function enqueueChunk(base64Data){
-  if (!base64Data) return;
-  chunkQueue.push(base64Data);
-  if (!chunkPlaying) playNextChunk();
-}
-
-function playNextChunk(){
-  if (chunkQueue.length === 0) { chunkPlaying = false; return; }
-  chunkPlaying = true;
-  const chunk = chunkQueue.shift();
-  const a = new Audio('data:audio/mpeg;base64,' + chunk);
-  if (!marks.audioPlayStart) mark('audioPlayStart');
-  a.onended = () => playNextChunk();
-  a.onerror = () => playNextChunk();
-  a.play().catch(() => playNextChunk());
-}
-
-async function connectAndTalk(){
-  if (connected) return;
-  resetMarks();
-  connected = true;
-  btn.textContent = '断开连接';
-  btn.classList.add('off');
-  setState('connecting');
-
-  stream = await navigator.mediaDevices.getUserMedia({
-    audio: { channelCount: 1, sampleRate: 16000, echoCancellation: true, noiseSuppression: true, autoGainControl: true }
-  });
-
-  ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws/phase1');
-  ws.binaryType = 'arraybuffer';
-
-  ws.onopen = () => {
-    mark('wsOpen');
-    ws.send(JSON.stringify({ type: 'start', codec: 'pcm16le', sampleRate: 16000 }));
-    audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
-    source = audioCtx.createMediaStreamSource(stream);
-    processor = audioCtx.createScriptProcessor(4096, 1, 1);
-    processor.onaudioprocess = (event) => {
-      if (!ws || ws.readyState !== 1) return;
-      const input = event.inputBuffer.getChannelData(0);
-      ws.send(floatTo16BitPCM(input));
-    };
-    source.connect(processor);
-    processor.connect(audioCtx.destination);
-    setState('streaming');
-  };
-
-  ws.onmessage = (evt) => {
-    const msg = JSON.parse(evt.data);
-    if (msg.type === 'final') {
-      mark('finalAsr');
-      asrEl.textContent = msg.text || '';
-      setState('thinking');
-      currentReply = '';
-      chunkQueue = [];
-      chunkPlaying = false;
-    }
-    if (msg.type === 'reply_text') {
-      if (!marks.firstReplyText) mark('firstReplyText');
-      currentReply += msg.text || '';
-      replyEl.textContent = currentReply;
-    }
-    if (msg.type === 'audio_chunk' && msg.audioChunk) {
-      if (!marks.firstAudioChunk) mark('firstAudioChunk');
-      enqueueChunk(msg.audioChunk);
-      setState('speaking');
-    }
-    if (msg.type === 'reply_done') {
-      mark('replyDone');
-      renderDebug(msg.metrics || undefined);
-      setState('streaming');
-    }
-    if (msg.type === 'error') {
-      replyEl.textContent = '错误：' + (msg.error || 'unknown');
-      disconnect();
-    }
-  };
-
-  ws.onclose = () => {
-    if (connected) disconnect();
-  };
-}
-
-function disconnect(){
-  if (!connected) return;
-  connected = false;
-  try { if (processor) processor.disconnect(); } catch {}
-  try { if (source) source.disconnect(); } catch {}
-  try { if (audioCtx) audioCtx.close(); } catch {}
-  try { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'stop' })); } catch {}
-  try { if (ws) ws.close(); } catch {}
-  try { if (stream) stream.getTracks().forEach(t => t.stop()); } catch {}
-  chunkQueue = [];
-  chunkPlaying = false;
-  btn.textContent = '连接并开始对话';
-  btn.classList.remove('off');
-  setState('idle');
-  renderDebug();
-}
-
-btn.addEventListener('click', () => {
-  if (connected) disconnect(); else connectAndTalk().catch((e) => {
-    replyEl.textContent = '连接失败：' + (e?.message || e);
-    disconnect();
-  });
-});
-</script></body></html>`;
-
-const phase191Page = `<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>VoiceClaw Phase 1.9.1</title>
-<style>
-body{font-family:system-ui;padding:24px;max-width:920px;margin:auto;background:#0b1020;color:#e8ecff}
-button{padding:12px 18px;border-radius:12px;border:none;background:#5b7cff;color:white;font-size:16px;cursor:pointer}
-button.off{background:#eb4d4b}
-.card{background:#121933;padding:16px;border-radius:16px;margin-top:16px}
-.mono{white-space:pre-wrap;font-family:ui-monospace,monospace}
-.state{display:inline-block;padding:6px 10px;border-radius:999px;background:#1f2a57;margin-left:8px}
-.hint{opacity:.8;font-size:14px;margin-top:10px}
-</style></head><body>
-<h1>VoiceClaw Phase 1.9.1（平滑流式播报）</h1>
-<p>WebAudio 时间轴连续播放 + 启动缓冲，减少分片停顿。</p>
-<p><a href="/phase19">返回 phase1.9</a></p>
-<div>
-  <button id="toggleBtn">连接并开始对话</button>
-  <span class="state" id="state">idle</span>
-</div>
-<div class="hint">参数：首播缓冲≈220ms；时间轴拼接；自动防抖。</div>
-<div class="card"><b>最新识别：</b><div id="asr" class="mono"></div></div>
-<div class="card"><b>助手回复：</b><div id="reply" class="mono"></div></div>
-<div class="card"><b>调试时间线：</b><div id="debug" class="mono"></div></div>
-<script>
-const btn = document.getElementById('toggleBtn');
-const stateEl = document.getElementById('state');
-const asrEl = document.getElementById('asr');
-const replyEl = document.getElementById('reply');
-const debugEl = document.getElementById('debug');
-let stream, ws, micCtx, source, processor;
-let connected = false;
-let currentReply = '';
-let marks = {};
-
-// 播放引擎（1.9.1 核心）
-let playCtx;
-let nextPlayTime = 0;
-let started = false;
-let pendingDur = 0;
-let decodeChain = Promise.resolve();
-const START_BUFFER_SEC = 0.22;
-const SAFETY_GAP_SEC = 0.015;
-
-function now(){ return performance.now(); }
-function fmt(ms){ return ms == null ? '-' : ms.toFixed(1) + 'ms'; }
-function mark(name){ marks[name] = now(); renderDebug(); }
-function resetMarks(){ marks = { turnStart: now() }; renderDebug(); }
-function renderDebug(serverMetrics){
-  const lines = [];
-  const delta = (a,b) => (marks[a] != null && marks[b] != null) ? (marks[b] - marks[a]) : null;
-  lines.push('ws_open=' + fmt(delta('turnStart','wsOpen')));
-  lines.push('asr=' + fmt(delta('turnStart','finalAsr')));
-  lines.push('llm首字=' + fmt(delta('finalAsr','firstReplyText')));
-  lines.push('首音频包=' + fmt(delta('finalAsr','firstAudioChunk')));
-  lines.push('开始播放=' + fmt(delta('finalAsr','audioPlayStart')));
-  lines.push('回包完成=' + fmt(delta('finalAsr','replyDone')));
-  if (serverMetrics) {
-    lines.push('--- server metrics ---');
-    lines.push('llmMs=' + fmt(serverMetrics.llmMs));
-    lines.push('ttsMs=' + fmt(serverMetrics.ttsMs));
-    lines.push('firstAudioLatency=' + fmt(serverMetrics.firstAudioLatency));
-  }
-  debugEl.textContent = lines.join('\\n');
-}
-
-function setState(s){ stateEl.textContent = s; }
-function floatTo16BitPCM(float32Array){
-  const buffer = new ArrayBuffer(float32Array.length * 2);
-  const view = new DataView(buffer);
-  let offset = 0;
-  for (let i = 0; i < float32Array.length; i++, offset += 2) {
-    let v = Math.max(-1, Math.min(1, float32Array[i]));
-    view.setInt16(offset, v < 0 ? v * 0x8000 : v * 0x7FFF, true);
-  }
-  return buffer;
-}
-
-function resetPlayer(){
-  started = false;
-  pendingDur = 0;
-  nextPlayTime = 0;
-  decodeChain = Promise.resolve();
-  if (!playCtx) {
-    playCtx = new (window.AudioContext || window.webkitAudioContext)();
-  }
 }
 
 function base64ToArrayBuffer(base64){
   const binary = atob(base64);
   const len = binary.length;
   const bytes = new Uint8Array(len);
-  for (let i=0;i<len;i++) bytes[i] = binary.charCodeAt(i);
+  for (let i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i);
   return bytes.buffer;
-}
-
-function enqueueChunk(base64Data){
-  if (!base64Data) return;
-  const arr = base64ToArrayBuffer(base64Data);
-  decodeChain = decodeChain.then(async () => {
-    if (!playCtx) return;
-    const audioBuf = await playCtx.decodeAudioData(arr.slice(0));
-    pendingDur += audioBuf.duration;
-
-    if (!started && pendingDur < START_BUFFER_SEC) return;
-
-    if (!started) {
-      started = true;
-      if (!marks.audioPlayStart) mark('audioPlayStart');
-      nextPlayTime = Math.max(playCtx.currentTime + 0.03, nextPlayTime || 0);
-    }
-
-    const src = playCtx.createBufferSource();
-    src.buffer = audioBuf;
-    src.connect(playCtx.destination);
-    src.start(nextPlayTime);
-    nextPlayTime += Math.max(0.001, audioBuf.duration - SAFETY_GAP_SEC);
-    pendingDur = Math.max(0, pendingDur - audioBuf.duration);
-  }).catch(()=>{});
-}
-
-async function connectAndTalk(){
-  if (connected) return;
-  resetMarks();
-  resetPlayer();
-  connected = true;
-  btn.textContent = '断开连接';
-  btn.classList.add('off');
-  setState('connecting');
-
-  stream = await navigator.mediaDevices.getUserMedia({
-    audio: { channelCount: 1, sampleRate: 16000, echoCancellation: true, noiseSuppression: true, autoGainControl: true }
-  });
-
-  ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws/phase1');
-  ws.binaryType = 'arraybuffer';
-
-  ws.onopen = () => {
-    mark('wsOpen');
-    ws.send(JSON.stringify({ type: 'start', codec: 'pcm16le', sampleRate: 16000 }));
-    micCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
-    source = micCtx.createMediaStreamSource(stream);
-    processor = micCtx.createScriptProcessor(4096, 1, 1);
-    processor.onaudioprocess = (event) => {
-      if (!ws || ws.readyState !== 1) return;
-      const input = event.inputBuffer.getChannelData(0);
-      ws.send(floatTo16BitPCM(input));
-    };
-    source.connect(processor);
-    processor.connect(micCtx.destination);
-    setState('streaming');
-  };
-
-  ws.onmessage = (evt) => {
-    const msg = JSON.parse(evt.data);
-    if (msg.type === 'final') {
-      mark('finalAsr');
-      asrEl.textContent = msg.text || '';
-      setState('thinking');
-      currentReply = '';
-      resetPlayer();
-    }
-    if (msg.type === 'reply_text') {
-      if (!marks.firstReplyText) mark('firstReplyText');
-      currentReply += msg.text || '';
-      replyEl.textContent = currentReply;
-    }
-    if (msg.type === 'audio_chunk' && msg.audioChunk) {
-      if (!marks.firstAudioChunk) mark('firstAudioChunk');
-      enqueueChunk(msg.audioChunk);
-      setState('speaking');
-    }
-    if (msg.type === 'reply_done') {
-      mark('replyDone');
-      renderDebug(msg.metrics || undefined);
-      setState('streaming');
-    }
-    if (msg.type === 'error') {
-      replyEl.textContent = '错误：' + (msg.error || 'unknown');
-      disconnect();
-    }
-  };
-
-  ws.onclose = () => { if (connected) disconnect(); };
-}
-
-function disconnect(){
-  if (!connected) return;
-  connected = false;
-  try { if (processor) processor.disconnect(); } catch {}
-  try { if (source) source.disconnect(); } catch {}
-  try { if (micCtx) micCtx.close(); } catch {}
-  try { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'stop' })); } catch {}
-  try { if (ws) ws.close(); } catch {}
-  try { if (stream) stream.getTracks().forEach(t => t.stop()); } catch {}
-  btn.textContent = '连接并开始对话';
-  btn.classList.remove('off');
-  setState('idle');
-  renderDebug();
-}
-
-btn.addEventListener('click', () => {
-  if (connected) disconnect();
-  else connectAndTalk().catch((e) => { replyEl.textContent = '连接失败：' + (e?.message || e); disconnect(); });
-});
-</script></body></html>`;
-
-const phase192Page = `<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>VoiceClaw Phase 1.9.2</title>
-<style>
-body{font-family:system-ui;padding:24px;max-width:920px;margin:auto;background:#0b1020;color:#e8ecff}
-button{padding:12px 18px;border-radius:12px;border:none;background:#5b7cff;color:white;font-size:16px;cursor:pointer}
-button.off{background:#eb4d4b}
-.card{background:#121933;padding:16px;border-radius:16px;margin-top:16px}
-.mono{white-space:pre-wrap;font-family:ui-monospace,monospace}
-.state{display:inline-block;padding:6px 10px;border-radius:999px;background:#1f2a57;margin-left:8px}
-.hint{opacity:.8;font-size:14px;margin-top:10px}
-</style></head><body>
-<h1>VoiceClaw Phase 1.9.2（首句修复）</h1>
-<p>基于 1.9.1：修复“首条 ASR 消息被丢弃”问题。</p>
-<p><a href="/phase191">返回 phase1.9.1</a></p>
-<div>
-  <button id="toggleBtn">连接并开始对话</button>
-  <span class="state" id="state">idle</span>
-</div>
-<div class="hint">此页仅用于验证首句识别是否恢复稳定。</div>
-<div class="card"><b>最新识别：</b><div id="asr" class="mono"></div></div>
-<div class="card"><b>助手回复：</b><div id="reply" class="mono"></div></div>
-<div class="card"><b>调试时间线：</b><div id="debug" class="mono"></div></div>
-<script>
-const btn = document.getElementById('toggleBtn');
-const stateEl = document.getElementById('state');
-const asrEl = document.getElementById('asr');
-const replyEl = document.getElementById('reply');
-const debugEl = document.getElementById('debug');
-let stream, ws, micCtx, source, processor;
-let connected = false;
-let currentReply = '';
-let marks = {};
-let playCtx;
-let canSendAudio = false;
-let pcmPrebuffer = [];
-const MAX_PREBUFFER_CHUNKS = 12;
-let activeTurnId = 0;
-let playerGeneration = 0;
-let activeSources = [];
-let nextPlayTime = 0;
-let started = false;
-let pendingDur = 0;
-let decodeChain = Promise.resolve();
-const START_BUFFER_SEC = 0.22;
-const SAFETY_GAP_SEC = 0.015;
-
-function now(){ return performance.now(); }
-function fmt(ms){ return ms == null ? '-' : ms.toFixed(1) + 'ms'; }
-function mark(name){ marks[name] = now(); renderDebug(); }
-function resetMarks(){ marks = { turnStart: now() }; renderDebug(); }
-function renderDebug(serverMetrics){
-  const lines = [];
-  const delta = (a,b) => (marks[a] != null && marks[b] != null) ? (marks[b] - marks[a]) : null;
-  lines.push('ws_open=' + fmt(delta('turnStart','wsOpen')));
-  lines.push('asr=' + fmt(delta('turnStart','finalAsr')));
-  lines.push('llm首字=' + fmt(delta('finalAsr','firstReplyText')));
-  lines.push('首音频包=' + fmt(delta('finalAsr','firstAudioChunk')));
-  lines.push('开始播放=' + fmt(delta('finalAsr','audioPlayStart')));
-  lines.push('回包完成=' + fmt(delta('finalAsr','replyDone')));
-  if (serverMetrics) {
-    lines.push('--- server metrics ---');
-    lines.push('llmMs=' + fmt(serverMetrics.llmMs));
-    lines.push('ttsMs=' + fmt(serverMetrics.ttsMs));
-    lines.push('firstAudioLatency=' + fmt(serverMetrics.firstAudioLatency));
-  }
-  debugEl.textContent = lines.join('\\n');
-}
-
-function setState(s){ stateEl.textContent = s; }
-function floatTo16BitPCM(float32Array){
-  const buffer = new ArrayBuffer(float32Array.length * 2);
-  const view = new DataView(buffer);
-  let offset = 0;
-  for (let i = 0; i < float32Array.length; i++, offset += 2) {
-    let v = Math.max(-1, Math.min(1, float32Array[i]));
-    view.setInt16(offset, v < 0 ? v * 0x8000 : v * 0x7FFF, true);
-  }
-  return buffer;
 }
 
 function resetPlayer(){
   playerGeneration += 1;
-  for (const s of activeSources) { try { s.stop(); } catch {} }
-  activeSources = [];
-  started = false;
-  pendingDur = 0;
   nextPlayTime = 0;
   decodeChain = Promise.resolve();
   if (!playCtx) playCtx = new (window.AudioContext || window.webkitAudioContext)();
 }
 
-function base64ToArrayBuffer(base64){
-  const binary = atob(base64);
-  const len = binary.length;
-  const bytes = new Uint8Array(len);
-  for (let i=0;i<len;i++) bytes[i] = binary.charCodeAt(i);
-  return bytes.buffer;
-}
-
-function enqueueChunk(base64Data, turnId){
+function enqueueChunk(base64Data){
   if (!base64Data) return;
-  if (turnId && turnId !== activeTurnId) return;
-  const gen = playerGeneration;
   const arr = base64ToArrayBuffer(base64Data);
+  const gen = playerGeneration;
   decodeChain = decodeChain.then(async () => {
-    if (!playCtx) return;
-    if (gen !== playerGeneration) return;
+    if (!playCtx || gen !== playerGeneration) return;
     const audioBuf = await playCtx.decodeAudioData(arr.slice(0));
-    pendingDur += audioBuf.duration;
-    if (!started && pendingDur < START_BUFFER_SEC) return;
-    if (!started) {
-      started = true;
-      if (!marks.audioPlayStart) mark('audioPlayStart');
-      nextPlayTime = Math.max(playCtx.currentTime + 0.03, nextPlayTime || 0);
-    }
+    if (gen !== playerGeneration) return;
+    if (!nextPlayTime) nextPlayTime = playCtx.currentTime + 0.03;
     const src = playCtx.createBufferSource();
     src.buffer = audioBuf;
     src.connect(playCtx.destination);
-    activeSources.push(src);
-    src.onended = () => { activeSources = activeSources.filter(x => x !== src); };
     src.start(nextPlayTime);
-    nextPlayTime += Math.max(0.001, audioBuf.duration - SAFETY_GAP_SEC);
-    pendingDur = Math.max(0, pendingDur - audioBuf.duration);
-  }).catch(()=>{});
+    nextPlayTime += Math.max(0.001, audioBuf.duration - 0.01);
+  }).catch(() => {});
 }
 
 async function connectAndTalk(){
   if (connected) return;
-  resetMarks();
-  resetPlayer();
-  canSendAudio = false;
-  pcmPrebuffer = [];
   connected = true;
   btn.textContent = '断开连接';
   btn.classList.add('off');
-  setState('requesting_mic');
+  setState('connecting');
+  asrPartialEl.textContent = '';
+  asrFinalEl.textContent = '';
+  replyEl.textContent = '';
+  activeTurnId = 0;
+  resetPlayer();
 
   try {
     stream = await navigator.mediaDevices.getUserMedia({
       audio: { channelCount: 1, sampleRate: 16000, echoCancellation: true, noiseSuppression: true, autoGainControl: true }
     });
   } catch (e) {
-    replyEl.textContent = '麦克风权限失败：' + (e?.message || e);
+    replyEl.textContent = '麦克风失败: ' + (e && e.message ? e.message : e);
     disconnect();
     return;
   }
 
-  setState('connecting');
-
-  ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws/phase1');
+  ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws/phase2-claw');
   ws.binaryType = 'arraybuffer';
 
   ws.onopen = () => {
-    mark('wsOpen');
-    ws.send(JSON.stringify({ type: 'start', codec: 'pcm16le', sampleRate: 16000 }));
+    dlog('ws open');
+    ws.send(JSON.stringify({
+      type: 'start',
+      codec: 'pcm16le',
+      sampleRate: 16000,
+      mode: 'openclaw',
+      proxyBase: proxyBaseEl.value,
+      agentId: agentIdEl.value,
+      chatMode: 'proxy',
+      enableBargeIn: !!enableBargeInEl.checked,
+      reuseSession: !!reuseSessionEl.checked
+    }));
     micCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
     source = micCtx.createMediaStreamSource(stream);
     processor = micCtx.createScriptProcessor(4096, 1, 1);
-    processor.onaudioprocess = (event) => {
-      if (!ws || ws.readyState !== 1) return;
-      const input = event.inputBuffer.getChannelData(0);
-      const pcm = floatTo16BitPCM(input);
-      if (!canSendAudio) {
-        pcmPrebuffer.push(pcm);
-        if (pcmPrebuffer.length > MAX_PREBUFFER_CHUNKS) pcmPrebuffer.shift();
-        return;
-      }
-      ws.send(pcm);
+    processor.onaudioprocess = (e) => {
+      if (ws && ws.readyState === 1) ws.send(floatTo16BitPCM(e.inputBuffer.getChannelData(0)));
     };
     source.connect(processor);
     processor.connect(micCtx.destination);
-    setState('warming');
+    setState('streaming');
   };
 
   ws.onmessage = (evt) => {
     const msg = JSON.parse(evt.data);
-    if (msg.type === 'ready') {
-      if (!canSendAudio) {
-        canSendAudio = true;
-        for (const pcm of pcmPrebuffer) { if (ws && ws.readyState === 1) ws.send(pcm); }
-        pcmPrebuffer = [];
+    if (typeof msg.turnId === 'number') {
+      if (msg.turnId < activeTurnId) return;
+      if (msg.turnId > activeTurnId) {
+        activeTurnId = msg.turnId;
+        replyEl.textContent = '';
+        resetPlayer();
       }
+    }
+    if (msg.type === 'partial') asrPartialEl.textContent = msg.text || '';
+    if (msg.type === 'final') { asrFinalEl.textContent = msg.text || ''; setState('thinking'); }
+    if (msg.type === 'reply_text') replyEl.textContent += msg.text || '';
+    if (msg.type === 'audio_chunk' && msg.audioChunk) { enqueueChunk(msg.audioChunk); setState('speaking'); }
+    if (msg.type === 'reply_done') {
+      const m = msg.metrics || {};
+      dlog(
+        'reply done ' +
+        '[turn=' + (msg.turnId || '-') + '] ' +
+        'asr_final=' + fmtTs(m.asrFinalAt) + ' ' +
+        'llm_start=' + fmtTs(m.llmStartAt) + ' ' +
+        'first_token=' + fmtTs(m.firstTokenAt) + ' ' +
+        'first_sentence=' + fmtTs(m.firstSentenceAt) + ' ' +
+        'first_audio=' + fmtTs(m.firstAudioAt) + ' ' +
+        'gw_first_delta=' + fmtTs(m.proxyGatewayFirstDeltaAt) + ' ' +
+        'llm_ms=' + fmtMs(m.llmMs) + ' ' +
+        'gw_first_delta_ms=' + fmtMs(m.proxyGatewayFirstDeltaMs) + ' ' +
+        'asr_to_first_token=' + fmtMs(m.asrToFirstTokenMs) + ' ' +
+        'asr_to_first_audio=' + fmtMs(m.asrToFirstAudioMs) + ' ' +
+        'tts_ms=' + fmtMs(m.ttsMs)
+      );
       setState('streaming');
     }
-    if (msg.type === 'final') {
-      const t = Number(msg.turnId || (activeTurnId + 1));
-      if (t !== activeTurnId) {
-        activeTurnId = t;
-        resetMarks();
-      }
-      mark('finalAsr');
-      asrEl.textContent = msg.text || '';
-      setState('thinking');
-      currentReply = '';
+    if (msg.type === 'metric' && msg.metric === 'session_start') {
+      dlog(
+        'session start ' +
+        'run=' + (msg.runId || '-') + ' ' +
+        'session=' + (msg.sessionKey || '-') + ' ' +
+        'reuse=' + (!!msg.reuseSession)
+      );
+    }
+    if (msg.type === 'barge_in') {
+      dlog('barge_in: stop current playback');
+      activeTurnId += 1;
       resetPlayer();
-    }
-    if (msg.type === 'reply_text') {
-      if (msg.turnId && Number(msg.turnId) !== activeTurnId) return;
-      if (!marks.firstReplyText) mark('firstReplyText');
-      currentReply += msg.text || '';
-      replyEl.textContent = currentReply;
-    }
-    if (msg.type === 'audio_chunk' && msg.audioChunk) {
-      if (msg.turnId && Number(msg.turnId) !== activeTurnId) return;
-      if (!marks.firstAudioChunk) mark('firstAudioChunk');
-      enqueueChunk(msg.audioChunk, Number(msg.turnId || activeTurnId));
-      setState('speaking');
-    }
-    if (msg.type === 'reply_done') {
-      if (msg.turnId && Number(msg.turnId) !== activeTurnId) return;
-      mark('replyDone');
-      renderDebug(msg.metrics || undefined);
       setState('streaming');
     }
     if (msg.type === 'error') {
-      replyEl.textContent = '错误：' + (msg.error || 'unknown');
-      disconnect();
+      replyEl.textContent = '错误: ' + (msg.error || 'unknown');
+      dlog('server error: ' + (msg.error || 'unknown'));
     }
   };
 
-  ws.onerror = (e) => {
-    replyEl.textContent = 'WS连接失败（可能网络/证书/代理问题）';
-  };
-
-  ws.onclose = () => { if (connected) disconnect(); };
+  ws.onerror = () => dlog('ws error');
+  ws.onclose = () => { dlog('ws close'); if (connected) disconnect(); };
 }
 
 function disconnect(){
@@ -1684,62 +1000,57 @@ function disconnect(){
   btn.textContent = '连接并开始对话';
   btn.classList.remove('off');
   setState('idle');
-  renderDebug();
 }
 
 btn.addEventListener('click', () => {
   if (connected) disconnect();
-  else connectAndTalk().catch((e) => { replyEl.textContent = '连接失败：' + (e?.message || e); disconnect(); });
+  else connectAndTalk().catch((e) => { replyEl.textContent = '连接失败: ' + (e && e.message ? e.message : e); disconnect(); });
 });
 </script></body></html>`;
 
 // ============ HTTP 服务器 ============
 const server = http.createServer(async (req, res) => {
-  if (req.method === 'GET' && req.url === '/') {
+  if (req.method === 'GET' && (req.url === '/lobster' || req.url === '/lobster-half' || req.url === '/phase2-lobster')) {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(page);
+    res.end(lobsterHalfDuplexPage);
     return;
   }
-  if (req.method === 'GET' && req.url === '/phase1') {
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(phase1Page);
-    return;
-  }
-  if (req.method === 'GET' && (req.url === '/phase18' || req.url === '/phase1.8' || req.url === '/face1.8')) {
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(phase18Page);
-    return;
-  }
-  if (req.method === 'GET' && (req.url === '/phase19' || req.url === '/phase1.9' || req.url === '/face1.9')) {
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(phase19Page);
-    return;
-  }
-  if (req.method === 'GET' && (req.url === '/phase191' || req.url === '/phase1.9.1' || req.url === '/face1.9.1')) {
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(phase191Page);
-    return;
-  }
-  if (req.method === 'GET' && (req.url === '/phase192' || req.url === '/phase1.9.2' || req.url === '/face1.9.2')) {
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(phase192Page);
-    return;
-  }
-  if (req.method === 'GET' && (req.url === '/phase193' || req.url === '/phase1.9.3' || req.url === '/face1.9.3')) {
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(phase192Page);
+  if (req.method === 'GET' && req.url?.startsWith('/api/gateway-heartbeat')) {
+    try {
+      const urlObj = new URL(req.url, 'http://127.0.0.1');
+      const gatewayUrl = (urlObj.searchParams.get('gatewayUrl') || 'http://127.0.0.1:18789').replace(/\/$/, '');
+      const gatewayToken = urlObj.searchParams.get('gatewayToken') || '';
+      const headers: Record<string, string> = {};
+      if (gatewayToken) headers.authorization = `Bearer ${gatewayToken}`;
+      const r = await fetch(`${gatewayUrl}/`, { method: 'GET', headers });
+      json(res, 200, { ok: r.ok, status: r.status });
+    } catch (e: any) {
+      json(res, 200, { ok: false, error: String(e?.message || e) });
+    }
     return;
   }
   res.writeHead(404); res.end('not found');
 });
 
-// ============ WebSocket 服务器 ============
-const wss = new WebSocketServer({ server, path: '/ws/phase1' });
+const wssPhase2 = new WebSocketServer({ noServer: true });
 
-wss.on('connection', (client) => {
+wssPhase2.on('connection', (client, req) => {
+  console.log('[PHASE2] ws connected from', req.socket.remoteAddress);
   let asrSession: StreamingAsrSession | null = null;
   let stopped = false;
   let turnCounter = 0;
+  let generation = 0; // bump on each new turn / barge-in to drop stale streams
+  let gw = {
+    gatewayUrl: 'http://127.0.0.1:18789',
+    gatewayToken: '',
+    model: 'openai-codex/gpt-5.3-codex',
+    tag: 'voiceclaw-phase2',
+    proxyBase: 'http://127.0.0.1:3456',
+    agentId: 'voice',
+    chatMode: 'proxy',
+    enableBargeIn: false,
+    reuseSession: false,
+  };
 
   const send = (data: unknown) => {
     if (client.readyState === WebSocket.OPEN) client.send(JSON.stringify(data));
@@ -1749,111 +1060,157 @@ wss.on('connection', (client) => {
     if (!isBinary) {
       const msg = JSON.parse(raw.toString());
       if (msg.type === 'start') {
+        console.log('[PHASE2] start', {
+          proxyBase: msg.proxyBase,
+          agentId: msg.agentId,
+          chatMode: msg.chatMode,
+          reuseSession: !!msg.reuseSession,
+        });
         stopped = false;
-        asrSession = new StreamingAsrSession(send, async (text) => {
-          if (stopped) return;
-          const turnId = ++turnCounter;
-          const asrDoneAt = Date.now();
-          console.log('[TEST] final_received=', JSON.stringify({ text, at: asrDoneAt }));
+        turnCounter = 0;
+        gw = {
+          gatewayUrl: msg.gatewayUrl || gw.gatewayUrl,
+          gatewayToken: msg.gatewayToken || '',
+          model: msg.model || gw.model,
+          tag: msg.tag || gw.tag,
+          proxyBase: msg.proxyBase || gw.proxyBase,
+          agentId: msg.agentId || gw.agentId,
+          chatMode: msg.chatMode || gw.chatMode,
+          enableBargeIn: !!msg.enableBargeIn,
+          reuseSession: !!msg.reuseSession,
+        };
 
-          const llmStartAt = Date.now();
-          let firstTtsAt: number | null = null;
-          const ttsTimings: number[] = [];
-          let fullReply = '';
+        asrSession = new StreamingAsrSession(
+          send,
+          async (text) => {
+            if (stopped) return;
+            const turnId = ++turnCounter;
+            const myGeneration = ++generation;
+            const asrFinalAt = Date.now();
+            const llmStartAt = Date.now();
+            let proxyGatewayFirstDeltaAt: number | null = null;
+            let proxyGatewayFirstDeltaMs: number | null = null;
+            let firstTokenAt: number | null = null;
+            let firstSentenceAt: number | null = null;
+            let firstTtsAt: number | null = null;
+            const ttsTimings: number[] = [];
+            const pendingTts: Promise<void>[] = [];
+            let fullReply = '';
 
-          // 并行追踪 TTS 任务
-          const pendingTts: Promise<void>[] = [];
-
-          try {
-            console.log('[TEST] calling streamChatWithKimi...');
-            fullReply = await streamChatWithKimi(
-              text,
-              // onToken: 流式显示
-              (token) => {
-                console.log('[TEST] onToken:', JSON.stringify(token));
+            try {
+              const handleToken = (token: string) => {
+                if (stopped || myGeneration !== generation) return;
+                if (!firstTokenAt) firstTokenAt = Date.now();
                 send({ type: 'reply_text', turnId, text: token });
-              },
-              // onSentence: 句子缓冲触发 TTS
-              (sentence) => {
-                console.log('[TEST] sentence_ready=', JSON.stringify(sentence));
+              };
+              const handleSentence = (sentence: string) => {
+                if (!firstSentenceAt) firstSentenceAt = Date.now();
                 const ttsStartAt = Date.now();
-                const ttsPromise = streamTTS(
-                  sentence,
-                  // onAudioChunk: 流式推音频
-                  (chunk) => {
-                    if (!firstTtsAt) {
-                      firstTtsAt = Date.now();
-                      console.log('[TEST] first_audio_chunk_latency=', firstTtsAt - llmStartAt);
-                    }
-                    console.log('[TEST] audio_chunk size:', chunk.length);
-                    send({ type: 'audio_chunk', turnId, audioChunk: chunk.toString('base64') });
-                  }
-                ).then(() => {
-                  console.log('[TEST] TTS done for sentence:', sentence.substring(0, 20));
+                const ttsPromise = streamTTS(sentence, (chunk) => {
+                  if (stopped || myGeneration !== generation) return;
+                  if (!firstTtsAt) firstTtsAt = Date.now();
+                  send({ type: 'audio_chunk', turnId, audioChunk: chunk.toString('base64') });
+                }).then(() => {
                   ttsTimings.push(Date.now() - ttsStartAt);
-                }).catch((err) => {
-                  console.error('[TEST] TTS error for sentence:', sentence.substring(0, 20), err);
-                });
+                }).catch(() => {});
                 pendingTts.push(ttsPromise);
+              };
+
+              if (gw.chatMode === 'direct') {
+                fullReply = await streamChatWithOpenClaw(text, gw, handleToken, handleSentence);
+              } else {
+                fullReply = await streamChatViaTestServer(
+                  text,
+                  gw,
+                  handleToken,
+                  handleSentence,
+                  (m) => {
+                    if (m.metric === 'gateway_first_delta') {
+                      if (typeof m.at === 'number') proxyGatewayFirstDeltaAt = m.at;
+                      if (typeof m.ms === 'number') proxyGatewayFirstDeltaMs = m.ms;
+                    }
+                  }
+                );
               }
-            );
-            console.log('[TEST] streamChatWithKimi returned, fullReply length:', fullReply.length);
 
-            // 等待所有 TTS 完成
-            console.log('[TEST] waiting for', pendingTts.length, 'TTS tasks...');
-            await Promise.all(pendingTts);
-            console.log('[TEST] all TTS tasks done');
-
-            const llmDoneAt = Date.now();
-            const totalTtsMs = ttsTimings.reduce((a, b) => a + b, 0);
-
-            console.log('[TEST] all_done=', JSON.stringify({
-              text,
-              replyText: fullReply,
-              llmMs: llmDoneAt - llmStartAt,
-              ttsMs: totalTtsMs,
-              firstAudioLatency: firstTtsAt ? firstTtsAt - llmStartAt : null,
-              e2eMs: llmDoneAt - asrDoneAt,
-            }));
-
-            // 保存到历史记录
-            addToHistory(text, fullReply);
-            console.log('[TEST] history saved, rounds=', (chatHistory.length - 1) / 2);
-
-            send({
-              type: 'reply_done',
-              turnId,
-              text: fullReply,
-              metrics: {
+              await Promise.all(pendingTts);
+              if (stopped || myGeneration !== generation) return;
+              const llmDoneAt = Date.now();
+              const replyDoneAt = Date.now();
+              const totalTtsMs = ttsTimings.reduce((a, b) => a + b, 0);
+              const metrics = {
+                asrFinalAt,
+                llmStartAt,
+                firstTokenAt,
+                firstSentenceAt,
+                firstAudioAt: firstTtsAt,
+                proxyGatewayFirstDeltaAt,
+                proxyGatewayFirstDeltaMs,
+                llmDoneAt,
+                replyDoneAt,
                 llmMs: llmDoneAt - llmStartAt,
                 ttsMs: totalTtsMs,
                 firstAudioLatency: firstTtsAt ? firstTtsAt - llmStartAt : null,
-              }
-            });
+                asrToFirstTokenMs: firstTokenAt ? firstTokenAt - asrFinalAt : null,
+                asrToFirstSentenceMs: firstSentenceAt ? firstSentenceAt - asrFinalAt : null,
+                asrToFirstAudioMs: firstTtsAt ? firstTtsAt - asrFinalAt : null,
+                asrToReplyDoneMs: replyDoneAt - asrFinalAt,
+              };
+              console.log('[PHASE2_METRICS]', JSON.stringify({ turnId, metrics }));
 
-          } catch (e: any) {
-            console.error('[TEST] error:', e);
-            send({ type: 'error', turnId, error: e.message || String(e) });
-          }
-        });
+              send({
+                type: 'reply_done',
+                turnId,
+                text: fullReply,
+                metrics,
+              });
+            } catch (e: any) {
+              if (stopped || myGeneration !== generation) return;
+              send({ type: 'error', turnId, error: e.message || String(e) });
+            }
+          },
+          gw.enableBargeIn
+            ? () => {
+                generation += 1;
+                send({ type: 'barge_in' });
+              }
+            : undefined
+        );
         asrSession.start();
       }
       if (msg.type === 'stop') {
         stopped = true;
+        generation += 1;
         asrSession?.finish();
       }
       return;
     }
 
-    if (!stopped) {
-      asrSession?.feedPcmChunk(Buffer.from(raw as Buffer));
-    }
+    if (!stopped) asrSession?.feedPcmChunk(Buffer.from(raw as Buffer));
   });
 
   client.on('close', () => {
+    console.log('[PHASE2] ws closed');
     stopped = true;
     asrSession?.close();
   });
+
+  client.on('error', (err) => {
+    console.log('[PHASE2] ws error', (err as any)?.message || err);
+  });
+});
+
+server.on('upgrade', (req, socket, head) => {
+  const pathname = new URL(req.url || '/', 'http://127.0.0.1').pathname;
+
+  if (pathname === '/ws/phase2-claw') {
+    wssPhase2.handleUpgrade(req, socket, head, (ws) => {
+      wssPhase2.emit('connection', ws, req);
+    });
+    return;
+  }
+
+  socket.destroy();
 });
 
 const port = Number(process.env.VOICECLAW_TEST_PORT || 3017);

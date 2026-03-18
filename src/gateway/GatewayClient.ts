@@ -19,15 +19,22 @@ export class GatewayClient {
   }
   
   // 发送消息，流式接收回复
-  async sendMessage(text: string): Promise<void> {
-    console.log(`[GW] 发送给龙虾: ${text.substring(0, 50)}...`);
-    
+  async sendMessage(text: string, agentId?: string): Promise<void> {
+    console.log(`[GW] 发送给龙虾${agentId ? ` (${agentId})` : ''}: ${text.substring(0, 50)}...`);
+
+    const headers: Record<string, string> = {
+      'Authorization': `Bearer ${this.token}`,
+      'Content-Type': 'application/json',
+    };
+
+    // 如果指定了 agentId，添加到 header
+    if (agentId) {
+      headers['X-Agent-Id'] = agentId;
+    }
+
     const response = await fetch(`${this.url}/v1/chat/completions`, {
       method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${this.token}`,
-        'Content-Type': 'application/json',
-      },
+      headers,
       body: JSON.stringify({
         model: this.model,
         stream: true,

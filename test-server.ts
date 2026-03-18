@@ -86,8 +86,9 @@ class GatewayClient {
   private connectNonce: string | null = null;
   private resolveConnect: (() => void) | null = null;
   private rejectConnect: ((err: Error) => void) | null = null;
-  private pendingResolves = new Map<string, (value: unknown) => void>();
+  private pendingResolves = new Map<string, (value: any) => void>();
   private reqId = 0;
+  private agentSessionKeys = new Map<string, string>();
 
   constructor(device: DeviceIdentity) {
     this.device = device;
@@ -188,11 +189,28 @@ class GatewayClient {
     this.ws.send(JSON.stringify(connectReq));
   }
 
-  async sendAgentMessage(message: string, agentId: string): Promise<string> {
+  async sendAgentMessage(
+    message: string,
+    agentId: string,
+    opts?: { reuseSession?: boolean; sessionKey?: string },
+  ): Promise<{ frame: any; sessionKey: string; runId?: string }> {
     if (!this.ws) throw new Error('Not connected');
 
     const id = `req-${++this.reqId}`;
-    const sessionKey = `agent:${agentId}:web-${Date.now()}`;
+    const explicitSessionKey = opts?.sessionKey?.trim();
+    let sessionKey = explicitSessionKey || '';
+    if (!sessionKey) {
+      if (opts?.reuseSession) {
+        // Reuse a sticky sessionKey per agent when the caller explicitly wants continuity.
+        sessionKey = this.agentSessionKeys.get(agentId) || '';
+        if (!sessionKey) {
+          sessionKey = `agent:${agentId}:web-sticky-${uuidv4()}`;
+          this.agentSessionKeys.set(agentId, sessionKey);
+        }
+      } else {
+        sessionKey = `agent:${agentId}:web-${uuidv4()}`;
+      }
+    }
 
     const reqFrame = {
       type: 'req', id, method: 'agent',
@@ -206,7 +224,10 @@ class GatewayClient {
     };
 
     return new Promise((resolve) => {
-      this.pendingResolves.set(id, resolve);
+      this.pendingResolves.set(id, (frame: any) => {
+        const runId = typeof frame?.payload?.runId === 'string' ? frame.payload.runId : undefined;
+        resolve({ frame, sessionKey, runId });
+      });
       this.ws!.send(JSON.stringify(reqFrame));
     });
   }
@@ -215,6 +236,10 @@ class GatewayClient {
 
   onEvent(handler: (event: unknown) => void) {
     this.eventHandlers.push(handler);
+  }
+
+  offEvent(handler: (event: unknown) => void) {
+    this.eventHandlers = this.eventHandlers.filter(h => h !== handler);
   }
 
   close() {
@@ -236,14 +261,6 @@ const server = createServer(async (req, res) => {
   }
 
   const url = req.url || '/';
-
-  // Serve HTML page
-  if (url === '/' || url === '/index.html') {
-    res.setHeader('Content-Type', 'text/html');
-    res.writeHead(200);
-    res.end(HTML_PAGE);
-    return;
-  }
 
   // API: Check device status
   if (url === '/api/status') {
@@ -316,7 +333,7 @@ const server = createServer(async (req, res) => {
     req.on('data', chunk => body += chunk);
     req.on('end', async () => {
       try {
-        const { message, agentId } = JSON.parse(body);
+        const { message, agentId, reuseSession } = JSON.parse(body);
         if (!message) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: 'Message required' }));
@@ -333,34 +350,101 @@ const server = createServer(async (req, res) => {
           'Cache-Control': 'no-cache',
           'Connection': 'keep-alive',
         });
+        const apiStartAt = Date.now();
+        let firstGatewayDeltaAt: number | null = null;
+        let targetRunId: string | undefined;
+        let targetSessionKey: string | undefined;
 
-        const client = new GatewayClient(device);
-        await client.connect();
+        // 使用全局预连接的 GatewayClient，如果没有则新建
+        let client = globalGatewayClient;
+        if (!client || !globalGatewayReady) {
+          console.log('[Gateway] 全局连接未就绪，新建连接...');
+          client = new GatewayClient(device);
+          await client.connect();
+        } else {
+          console.log('[Gateway] 复用预连接');
+        }
 
-        // Send message
-        await client.sendAgentMessage(message, agentId);
+        // 先挂监听，再发送消息，避免事件竞态丢失
+        let finished = false;
+        const finish = () => {
+          if (finished) return;
+          finished = true;
+          client.offEvent(eventHandler);
+          if (client !== globalGatewayClient) {
+            client.close();
+          }
+          res.end();
+        };
 
-        // Listen for events
-        client.onEvent((event: unknown) => {
+        const eventHandler = (event: unknown) => {
           const e = event as Record<string, unknown>;
+          const payload =
+            e.payload && typeof e.payload === 'object'
+              ? (e.payload as Record<string, unknown>)
+              : {};
+          const eventRunId = typeof payload.runId === 'string' ? payload.runId : '';
+          const eventSessionKey = typeof payload.sessionKey === 'string' ? payload.sessionKey : '';
+          const matchesRun = !!targetRunId && eventRunId === targetRunId;
+          const matchesSession = !!targetSessionKey && eventSessionKey === targetSessionKey;
+          const shouldForward = targetRunId
+            ? (matchesRun || (!eventRunId && matchesSession))
+            : matchesSession;
+
+          if (!shouldForward) {
+            return;
+          }
+
+          console.log('[Gateway Event]', JSON.stringify(e).substring(0, 200));
           res.write(`data: ${JSON.stringify(e)}\n\n`);
 
-          // End on final or error
-          if (e.event === 'chat_event') {
-            const payload = e.payload as Record<string, unknown>;
-            if (payload.state === 'final' || payload.state === 'error') {
-              res.write('data: [DONE]\n\n');
-              client.close();
-              res.end();
+          if (e.event === 'agent') {
+            const stream = payload?.stream;
+            const delta = (payload?.data as Record<string, unknown> | undefined)?.delta;
+            if (stream === 'assistant' && typeof delta === 'string' && delta.length > 0 && !firstGatewayDeltaAt) {
+              firstGatewayDeltaAt = Date.now();
+              const metric = {
+                type: 'metric',
+                metric: 'gateway_first_delta',
+                at: firstGatewayDeltaAt,
+                ms: firstGatewayDeltaAt - apiStartAt,
+              };
+              console.log('[Gateway Metric]', metric);
+              res.write(`data: ${JSON.stringify(metric)}\n\n`);
             }
           }
+
+          // End on final or error
+          if (e.event === 'chat') {
+            console.log('[Gateway] chat event state:', payload.state);
+            if (payload.state === 'final' || payload.state === 'error') {
+              console.log('[Gateway] Sending [DONE]');
+              res.write('data: [DONE]\n\n');
+              finish();
+            }
+          }
+        };
+        client.onEvent(eventHandler);
+
+        // Send message
+        const started = await client.sendAgentMessage(message, agentId, {
+          reuseSession: !!reuseSession,
         });
+        targetRunId = started.runId;
+        targetSessionKey = started.sessionKey;
+        res.write(`data: ${JSON.stringify({
+          type: 'metric',
+          metric: 'session_start',
+          runId: targetRunId,
+          sessionKey: targetSessionKey,
+          reuseSession: !!reuseSession,
+        })}\n\n`);
 
         // Timeout
         setTimeout(() => {
+          if (finished) return;
           res.write('data: [TIMEOUT]\n\n');
-          client.close();
-          res.end();
+          finish();
         }, 60000);
 
       } catch (err) {
@@ -375,12 +459,33 @@ const server = createServer(async (req, res) => {
   res.end('Not found');
 });
 
-// Load HTML page from file
-const HTML_PAGE = readFileSync('./test-page.html', 'utf8');
+// 全局 Gateway 连接（预连接复用）
+let globalGatewayClient: GatewayClient | null = null;
+let globalGatewayReady = false;
+
+async function initGateway(): Promise<void> {
+  const device = loadDeviceIdentity();
+  if (!device) {
+    console.log('[Gateway] 未配置 Device，跳过预连接');
+    return;
+  }
+  console.log('[Gateway] 正在预连接...');
+  globalGatewayClient = new GatewayClient(device);
+  try {
+    await globalGatewayClient.connect();
+    globalGatewayReady = true;
+    console.log('[Gateway] 预连接成功，已就绪');
+  } catch (err) {
+    console.error('[Gateway] 预连接失败:', err);
+    globalGatewayClient = null;
+  }
+}
 
 server.listen(PORT, () => {
   console.log(`🚀 VoiceClaw 测试服务器已启动`);
   console.log(`📱 打开 http://localhost:${PORT} 查看测试页面`);
   console.log('');
   console.log('按 Ctrl+C 停止服务器');
+  // 启动时预连接 Gateway
+  initGateway();
 });
