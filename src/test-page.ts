@@ -1,4 +1,6 @@
 import http from 'http';
+import fs from 'fs';
+import os from 'os';
 import { gzipSync, gunzipSync } from 'zlib';
 import WebSocket, { WebSocketServer } from 'ws';
 import { v4 as uuidv4 } from 'uuid';
@@ -8,6 +10,66 @@ import { config } from './config';
 function json(res: http.ServerResponse, code: number, data: unknown) {
   res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify(data));
+}
+
+// ============ Session 持久化 ============
+interface SessionRecord {
+  id: string;
+  sessionKey: string;
+  agentId: string;
+  createdAt: number;
+  lastUsedAt: number;
+  turnCount: number;
+}
+interface SessionFile {
+  lastSessionId: string | null;
+  sessions: SessionRecord[];
+}
+
+const SESSION_FILE = `${os.homedir()}/.openclaw/voiceclaw-sessions.json`;
+
+function loadSessionFile(): SessionFile {
+  try {
+    return JSON.parse(fs.readFileSync(SESSION_FILE, 'utf8'));
+  } catch {
+    return { lastSessionId: null, sessions: [] };
+  }
+}
+
+function saveSessionFile(data: SessionFile) {
+  try {
+    fs.mkdirSync(`${os.homedir()}/.openclaw`, { recursive: true });
+    fs.writeFileSync(SESSION_FILE, JSON.stringify(data, null, 2));
+  } catch (e) {
+    console.error('[Session] save failed:', e);
+  }
+}
+
+function createSession(agentId: string): SessionRecord {
+  const rec: SessionRecord = {
+    id: uuidv4(),
+    sessionKey: `agent:${agentId}:web-sticky-${uuidv4()}`,
+    agentId,
+    createdAt: Date.now(),
+    lastUsedAt: Date.now(),
+    turnCount: 0,
+  };
+  const data = loadSessionFile();
+  data.sessions.push(rec);
+  data.lastSessionId = rec.id;
+  saveSessionFile(data);
+  return rec;
+}
+
+function touchSession(sessionKey: string) {
+  const data = loadSessionFile();
+  const rec = data.sessions.find(s => s.sessionKey === sessionKey);
+  if (rec) {
+    rec.lastUsedAt = Date.now();
+    rec.turnCount += 1;
+    data.lastSessionId = rec.id;
+    saveSessionFile(data);
+  }
 }
 
 function asrHeader(type: number, flag: number, serialization: number, compression: number) {
@@ -217,7 +279,7 @@ async function streamChatWithOpenClaw(
 
 async function streamChatViaTestServer(
   text: string,
-  opts: { proxyBase?: string; agentId?: string; reuseSession?: boolean },
+  opts: { proxyBase?: string; agentId?: string; sessionKey?: string },
   onToken: (token: string) => void,
   onSentence: (sentence: string) => void,
   onMetric?: (metric: { metric: string; at?: number; ms?: number }) => void
@@ -229,7 +291,7 @@ async function streamChatViaTestServer(
   const response = await fetch(`${proxyBase}/api/chat`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ message: text, agentId, reuseSession: !!opts.reuseSession }),
+    body: JSON.stringify({ message: text, agentId, sessionKey: opts.sessionKey || '', reuseSession: !!opts.sessionKey }),
   });
 
   if (!response.ok || !response.body) {
@@ -546,6 +608,7 @@ class StreamingAsrSession {
   private connectAttempts = 0;
   private readonly maxConnectAttempts = 6;
   private runningReply = false;
+  private replyVersion = 0;  // 防止 stale .finally() 覆盖 barge-in 后的状态
   private processedUtteranceIds = new Set<string>();
   private currentTurnText = '';
   private lastProcessedText = ''; // 跟踪上一轮处理过的文本，用于过滤累积
@@ -659,6 +722,9 @@ class StreamingAsrSession {
         if (this.onBargeIn && utterances.length > this.lastUtteranceCount && this.runningReply && !this.bargeInSent) {
           console.log('[ASR] barge-in detected, new utterances:', utterances.length - this.lastUtteranceCount);
           this.bargeInSent = true;
+          this.runningReply = false;   // 立即释放，允许新发话触发 final
+          this.currentTurnText = '';
+          this.replyVersion++;         // 使旧 .finally() 失效
           this.sendEvent({ type: 'barge_in' });
           this.onBargeIn?.();
         }
@@ -692,6 +758,7 @@ class StreamingAsrSession {
           if (this.currentTurnText) {
             console.log('[ASR] triggering final with definite text:', this.currentTurnText);
             this.runningReply = true;
+            const myVersion = ++this.replyVersion;
             const finalText = this.currentTurnText;
             this.sendEvent({ type: 'final', text: finalText });
 
@@ -699,10 +766,10 @@ class StreamingAsrSession {
             this.lastProcessedText = text;
 
             this.processReply(finalText).finally(() => {
+              if (this.replyVersion !== myVersion) return; // barge-in 已重置，不覆盖
               this.runningReply = false;
               this.currentTurnText = '';
-              this.bargeInSent = false; // 重置打断状态
-              // 注意：不要重置 lastUtteranceCount，ASR连接是持续的
+              this.bargeInSent = false;
             });
           }
         }
@@ -784,8 +851,10 @@ const lobsterHalfDuplexPage = `<!doctype html>
 body{font-family:system-ui;padding:24px;max-width:980px;margin:auto;background:#0a1226;color:#e8ecff}
 button{padding:12px 18px;border-radius:12px;border:none;background:#4e8cff;color:white;font-size:16px;cursor:pointer}
 button.off{background:#de4f5f}
+button.sm{padding:7px 12px;font-size:13px;background:#2a3a6a}
 input{padding:8px 10px;border-radius:8px;border:1px solid #2f3a63;background:#101a37;color:#e8ecff;width:100%;margin-top:6px}
 input[type="checkbox"]{width:auto;margin-top:0}
+select{padding:8px 10px;border-radius:8px;border:1px solid #2f3a63;background:#101a37;color:#e8ecff;width:100%;margin-top:6px;font-size:14px}
 .card{background:#121f42;padding:14px;border-radius:14px;margin-top:14px}
 .mono{white-space:pre-wrap;font-family:ui-monospace,monospace}
 .state{display:inline-block;padding:6px 10px;border-radius:999px;background:#213160;margin-left:8px}
@@ -793,6 +862,7 @@ input[type="checkbox"]{width:auto;margin-top:0}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
 .hint{opacity:.86;font-size:14px}
 .checkline{display:flex;align-items:center;gap:8px;margin-top:10px}
+.session-row{display:flex;gap:8px;align-items:flex-end;margin-top:6px}
 </style></head><body>
 <h1>龙虾半双工语音对话</h1>
 <p class="hint">链路：麦克风 -> 火山 ASR -> OpenClaw voice agent -> 火山 TTS。纯 proxy 模式，支持实时播放和打断。</p>
@@ -800,7 +870,15 @@ input[type="checkbox"]{width:auto;margin-top:0}
   <div><label>Proxy URL（根目录 test-server）</label><input id="proxyBase" value="http://127.0.0.1:3456"></div>
   <div><label>Agent ID</label><input id="agentId" value="voice"></div>
   <div class="checkline"><input id="enableBargeIn" type="checkbox"><label for="enableBargeIn">启用 Barge-in 打断</label></div>
-  <div class="checkline"><input id="reuseSession" type="checkbox"><label for="reuseSession">复用 Session（保留上下文）</label></div>
+  <div>
+    <label>Session</label>
+    <div class="session-row">
+      <select id="sessionSelect" style="flex:1"></select>
+      <button class="sm" id="newSessionBtn" type="button">+ 新建</button>
+      <button class="sm" id="delSessionBtn" type="button" style="background:#5a2a2a">删除</button>
+      <button class="sm" id="clearSessionBtn" type="button" style="background:#3a2a1a">清空</button>
+    </div>
+  </div>
 </div>
 <div style="margin-top:12px">
   <button id="toggleBtn">连接并开始对话</button>
@@ -820,7 +898,10 @@ const debugEl = document.getElementById('debug');
 const proxyBaseEl = document.getElementById('proxyBase');
 const agentIdEl = document.getElementById('agentId');
 const enableBargeInEl = document.getElementById('enableBargeIn');
-const reuseSessionEl = document.getElementById('reuseSession');
+const sessionSelect = document.getElementById('sessionSelect');
+const newSessionBtn = document.getElementById('newSessionBtn');
+const delSessionBtn = document.getElementById('delSessionBtn');
+const clearSessionBtn = document.getElementById('clearSessionBtn');
 
 let connected = false, stream, ws, micCtx, source, processor;
 let playCtx = null, nextPlayTime = 0, decodeChain = Promise.resolve(), playerGeneration = 0;
@@ -837,7 +918,79 @@ function dlog(msg){
   debugEl.textContent = '[' + t + '] ' + msg + '\\n' + (debugEl.textContent || '');
 }
 
-reuseSessionEl.checked = false;
+function timeAgo(ts) {
+  const s = Math.floor((Date.now() - ts) / 1000);
+  if (s < 60) return s + '秒前';
+  if (s < 3600) return Math.floor(s / 60) + '分钟前';
+  if (s < 86400) return Math.floor(s / 3600) + '小时前';
+  return Math.floor(s / 86400) + '天前';
+}
+
+async function loadSessions() {
+  const agentId = agentIdEl.value || 'voice';
+  try {
+    const r = await fetch('/api/sessions?agentId=' + encodeURIComponent(agentId));
+    const data = await r.json();
+    const sessions = data.sessions || [];
+    const lastId = data.lastSessionId;
+    sessionSelect.innerHTML = '';
+    if (sessions.length === 0) {
+      const opt = document.createElement('option');
+      opt.value = '';
+      opt.textContent = '（无已保存 session）';
+      sessionSelect.appendChild(opt);
+    } else {
+      sessions.slice().reverse().forEach(s => {
+        const opt = document.createElement('option');
+        opt.value = s.sessionKey;
+        opt.textContent = s.turnCount + '轮 · ' + timeAgo(s.lastUsedAt) + ' · ' + s.sessionKey.slice(-8);
+        opt.dataset.id = s.id;
+        sessionSelect.appendChild(opt);
+      });
+      if (lastId) {
+        const lastSession = sessions.find(s => s.id === lastId);
+        if (lastSession) sessionSelect.value = lastSession.sessionKey;
+      }
+    }
+  } catch(e) {
+    dlog('load sessions failed: ' + e);
+  }
+}
+
+newSessionBtn.addEventListener('click', async () => {
+  const agentId = agentIdEl.value || 'voice';
+  try {
+    const r = await fetch('/api/sessions/new', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ agentId }),
+    });
+    const rec = await r.json();
+    await loadSessions();
+    sessionSelect.value = rec.sessionKey;
+    dlog('新建 session: ' + rec.sessionKey.slice(-8));
+  } catch(e) {
+    dlog('new session failed: ' + e);
+  }
+});
+
+delSessionBtn.addEventListener('click', async () => {
+  const key = sessionSelect.value;
+  if (!key) return;
+  await fetch('/api/sessions/' + encodeURIComponent(key), { method: 'DELETE' });
+  dlog('删除 session: ' + key.slice(-8));
+  await loadSessions();
+});
+
+clearSessionBtn.addEventListener('click', async () => {
+  if (!confirm('清空所有已保存的 session？')) return;
+  const agentId = agentIdEl.value || 'voice';
+  await fetch('/api/sessions?agentId=' + encodeURIComponent(agentId), { method: 'DELETE' });
+  dlog('清空所有 session');
+  await loadSessions();
+});
+
+loadSessions();
 
 function floatTo16BitPCM(float32Array){
   const buffer = new ArrayBuffer(float32Array.length * 2);
@@ -862,7 +1015,8 @@ function resetPlayer(){
   playerGeneration += 1;
   nextPlayTime = 0;
   decodeChain = Promise.resolve();
-  if (!playCtx) playCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (playCtx) { playCtx.close().catch(() => {}); playCtx = null; }
+  playCtx = new (window.AudioContext || window.webkitAudioContext)();
 }
 
 function enqueueChunk(base64Data){
@@ -918,7 +1072,7 @@ async function connectAndTalk(){
       agentId: agentIdEl.value,
       chatMode: 'proxy',
       enableBargeIn: !!enableBargeInEl.checked,
-      reuseSession: !!reuseSessionEl.checked
+      sessionKey: sessionSelect.value || '',
     }));
     micCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
     source = micCtx.createMediaStreamSource(stream);
@@ -963,6 +1117,7 @@ async function connectAndTalk(){
         'tts_ms=' + fmtMs(m.ttsMs)
       );
       setState('streaming');
+      loadSessions();
     }
     if (msg.type === 'metric' && msg.metric === 'session_start') {
       dlog(
@@ -1015,6 +1170,44 @@ const server = http.createServer(async (req, res) => {
     res.end(lobsterHalfDuplexPage);
     return;
   }
+  if (req.method === 'GET' && req.url?.startsWith('/api/sessions')) {
+    const urlObj = new URL(req.url, 'http://127.0.0.1');
+    const agentId = urlObj.searchParams.get('agentId') || 'voice';
+    const data = loadSessionFile();
+    const sessions = data.sessions.filter(s => s.agentId === agentId);
+    json(res, 200, { sessions, lastSessionId: data.lastSessionId });
+    return;
+  }
+  if (req.method === 'POST' && req.url === '/api/sessions/new') {
+    let body = '';
+    req.on('data', c => body += c);
+    req.on('end', () => {
+      const { agentId = 'voice' } = JSON.parse(body || '{}');
+      const rec = createSession(agentId);
+      json(res, 200, rec);
+    });
+    return;
+  }
+  if (req.method === 'DELETE' && req.url?.startsWith('/api/sessions/')) {
+    const sessionKey = decodeURIComponent(req.url.slice('/api/sessions/'.length));
+    const data = loadSessionFile();
+    data.sessions = data.sessions.filter(s => s.sessionKey !== sessionKey);
+    if (data.lastSessionId && !data.sessions.find(s => s.id === data.lastSessionId)) {
+      data.lastSessionId = data.sessions[data.sessions.length - 1]?.id || null;
+    }
+    saveSessionFile(data);
+    json(res, 200, { ok: true });
+    return;
+  }
+  if (req.method === 'DELETE' && req.url === '/api/sessions') {
+    const data = loadSessionFile();
+    const agentId = new URL(req.url, 'http://x').searchParams.get('agentId');
+    data.sessions = agentId ? data.sessions.filter(s => s.agentId !== agentId) : [];
+    data.lastSessionId = data.sessions[data.sessions.length - 1]?.id || null;
+    saveSessionFile(data);
+    json(res, 200, { ok: true });
+    return;
+  }
   if (req.method === 'GET' && req.url?.startsWith('/api/gateway-heartbeat')) {
     try {
       const urlObj = new URL(req.url, 'http://127.0.0.1');
@@ -1049,7 +1242,7 @@ wssPhase2.on('connection', (client, req) => {
     agentId: 'voice',
     chatMode: 'proxy',
     enableBargeIn: false,
-    reuseSession: false,
+    sessionKey: '',
   };
 
   const send = (data: unknown) => {
@@ -1064,7 +1257,7 @@ wssPhase2.on('connection', (client, req) => {
           proxyBase: msg.proxyBase,
           agentId: msg.agentId,
           chatMode: msg.chatMode,
-          reuseSession: !!msg.reuseSession,
+          sessionKey: msg.sessionKey,
         });
         stopped = false;
         turnCounter = 0;
@@ -1077,7 +1270,7 @@ wssPhase2.on('connection', (client, req) => {
           agentId: msg.agentId || gw.agentId,
           chatMode: msg.chatMode || gw.chatMode,
           enableBargeIn: !!msg.enableBargeIn,
-          reuseSession: !!msg.reuseSession,
+          sessionKey: msg.sessionKey || '',
         };
 
         asrSession = new StreamingAsrSession(
@@ -1164,6 +1357,7 @@ wssPhase2.on('connection', (client, req) => {
                 text: fullReply,
                 metrics,
               });
+              if (gw.sessionKey) touchSession(gw.sessionKey);
             } catch (e: any) {
               if (stopped || myGeneration !== generation) return;
               send({ type: 'error', turnId, error: e.message || String(e) });

@@ -333,7 +333,7 @@ const server = createServer(async (req, res) => {
     req.on('data', chunk => body += chunk);
     req.on('end', async () => {
       try {
-        const { message, agentId, reuseSession } = JSON.parse(body);
+        const { message, agentId, reuseSession, sessionKey } = JSON.parse(body);
         if (!message) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: 'Message required' }));
@@ -429,6 +429,7 @@ const server = createServer(async (req, res) => {
         // Send message
         const started = await client.sendAgentMessage(message, agentId, {
           reuseSession: !!reuseSession,
+          sessionKey: sessionKey || '',
         });
         targetRunId = started.runId;
         targetSessionKey = started.sessionKey;
