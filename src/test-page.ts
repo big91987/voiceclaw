@@ -844,6 +844,148 @@ class StreamingAsrSession {
   }
 }
 
+// ============ 副语言 ASR Session（副语言特征全开 + 二遍识别）============
+class ParaAsrSession {
+  private ws: WebSocket | null = null;
+  private nextSeq = 2;
+  private ready = false;
+  private closed = false;
+  private runningReply = false;
+  private replyVersion = 0;
+  private processedIds = new Set<string | number>();
+  private currentTurnText = '';
+  private currentTurnAdditions: any = null;
+  private lastProcessedText = '';
+  private lastUtteranceCount = 0;
+  private bargeInSent = false;
+
+  constructor(
+    private sendEvent: (data: unknown) => void,
+    private onFinal: (text: string, additions: any) => Promise<void>,
+    private onBargeIn?: () => void,
+  ) {}
+
+  start() {
+    this.closed = false;
+    this.ready = false;
+    this.nextSeq = 2;
+    this.ws = new WebSocket('wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async', {
+      headers: {
+        'X-Api-App-Key': config.asrAppId,
+        'X-Api-Access-Key': config.asrApiKey,
+        'X-Api-Resource-Id': 'volc.bigasr.sauc.duration',
+        'X-Api-Connect-Id': uuidv4(),
+      },
+      skipUTF8Validation: true,
+    });
+
+    this.ws.on('open', () => {
+      this.ws?.send(asrFullClientRequest({
+        user: { uid: uuidv4() },
+        audio: { format: 'pcm', codec: 'raw', rate: 16000, bits: 16, channel: 1 },
+        request: {
+          model_name: 'bigmodel',
+          enable_itn: true,
+          enable_punc: true,
+          show_utterances: true,
+          enable_nonstream: true,
+          enable_emotion_detection: true,
+          enable_gender_detection: true,
+          show_speech_rate: true,
+          show_volume: true,
+          end_window_size: 800,
+        },
+      }));
+    });
+
+    this.ws.on('message', async (raw) => {
+      const msg = parseAsr(Buffer.from(raw as Buffer));
+      if (msg.type === 15) { this.sendEvent({ type: 'error', error: msg.payload }); return; }
+      if (msg.type !== 9) return;
+      try {
+        const parsed = JSON.parse(msg.payload);
+        const text = parsed?.result?.text || '';
+        const utterances: any[] = parsed?.result?.utterances || [];
+        const definiteUtterances = utterances.filter((u: any) => u?.definite === true);
+        const hasDefinite = definiteUtterances.length > 0;
+
+        if (!this.ready) { this.ready = true; this.sendEvent({ type: 'ready' }); }
+
+        let displayText = text || '';
+        if (this.lastProcessedText && displayText) {
+          const norm = this.lastProcessedText.trim();
+          const disp = displayText.trim();
+          if (disp.startsWith(norm)) displayText = disp.slice(norm.length).trim().replace(/^[，。！？,.!?\s]+/, '');
+        }
+        if (displayText) this.sendEvent({ type: 'partial', text: displayText, hasDefinite });
+
+        if (this.onBargeIn && utterances.length > this.lastUtteranceCount && this.runningReply && !this.bargeInSent) {
+          this.bargeInSent = true;
+          this.runningReply = false;
+          this.currentTurnText = '';
+          this.currentTurnAdditions = null;
+          this.replyVersion++;
+          this.sendEvent({ type: 'barge_in' });
+          this.onBargeIn?.();
+        }
+        this.lastUtteranceCount = utterances.length;
+
+        if (hasDefinite && !this.runningReply) {
+          const newDef = definiteUtterances.filter((u: any) => {
+            const uid = u?.utterance_id ?? u?.start_time;
+            if (!this.processedIds.has(uid)) { this.processedIds.add(uid); return true; }
+            return false;
+          });
+          if (newDef.length > 0) {
+            const turnText = newDef.map((u: any) => String(u?.text || '').trim()).filter(Boolean).join(' ');
+            if (turnText) {
+              this.currentTurnText += (this.currentTurnText ? ' ' : '') + turnText;
+              this.currentTurnAdditions = newDef[newDef.length - 1]?.additions || this.currentTurnAdditions;
+            }
+          }
+          if (this.currentTurnText) {
+            this.runningReply = true;
+            const myVersion = ++this.replyVersion;
+            const finalText = this.currentTurnText;
+            const additions = this.currentTurnAdditions;
+            this.sendEvent({ type: 'final', text: finalText, additions });
+            if (additions) this.sendEvent({ type: 'para_features', additions });
+            this.lastProcessedText = text;
+            this.onFinal(finalText, additions).finally(() => {
+              if (this.replyVersion !== myVersion) return;
+              this.runningReply = false;
+              this.currentTurnText = '';
+              this.currentTurnAdditions = null;
+              this.bargeInSent = false;
+            });
+          }
+        }
+      } catch (e) { console.error('[PARA_ASR] parse error:', e); }
+    });
+
+    this.ws.on('close', () => { this.sendEvent({ type: 'closed' }); });
+    this.ws.on('error', (err) => { this.sendEvent({ type: 'error', error: (err as any)?.message || String(err) }); });
+  }
+
+  feedPcmChunk(chunk: Buffer) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.ready || this.closed || !chunk.length) return;
+    for (let off = 0; off < chunk.length; off += 6400) {
+      const piece = chunk.subarray(off, off + 6400);
+      if (piece.length) this.ws.send(asrAudioOnly(this.nextSeq++, piece));
+    }
+  }
+
+  finish() {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || this.closed) return;
+    this.ws.send(asrAudioOnlyLast(Buffer.alloc(0)));
+  }
+
+  close() {
+    this.closed = true;
+    if (this.ws) { this.ws.close(); this.ws = null; }
+  }
+}
+
 const lobsterHalfDuplexPage = `<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>龙虾半双工语音对话</title>
@@ -1163,11 +1305,411 @@ btn.addEventListener('click', () => {
 });
 </script></body></html>`;
 
+const paralinguisticPage = `<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>副语言特征分析</title>
+<style>
+body{font-family:system-ui;padding:24px;max-width:1100px;margin:auto;background:#0a1226;color:#e8ecff}
+button{padding:12px 18px;border-radius:12px;border:none;background:#4e8cff;color:white;font-size:16px;cursor:pointer}
+button.off{background:#de4f5f}
+button.sm{padding:7px 12px;font-size:13px;background:#2a3a6a}
+input{padding:8px 10px;border-radius:8px;border:1px solid #2f3a63;background:#101a37;color:#e8ecff;width:100%;margin-top:6px}
+input[type="checkbox"]{width:auto;margin-top:0}
+select{padding:8px 10px;border-radius:8px;border:1px solid #2f3a63;background:#101a37;color:#e8ecff;width:100%;margin-top:6px;font-size:14px}
+.card{background:#121f42;padding:14px;border-radius:14px;margin-top:14px}
+.mono{white-space:pre-wrap;font-family:ui-monospace,monospace;font-size:13px}
+.state{display:inline-block;padding:6px 10px;border-radius:999px;background:#213160;margin-left:8px}
+.ok{background:#1f6f43}.bad{background:#8f2b2b}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.hint{opacity:.86;font-size:14px}
+.checkline{display:flex;align-items:center;gap:8px;margin-top:10px}
+.session-row{display:flex;gap:8px;align-items:flex-end;margin-top:6px}
+/* 副语言面板 */
+.para-dashboard{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-top:14px}
+.feat-card{background:#121f42;border-radius:14px;padding:16px 12px;text-align:center;transition:background .4s}
+.feat-title{font-size:12px;opacity:.6;margin-bottom:6px;text-transform:uppercase;letter-spacing:.04em}
+.feat-emoji{font-size:40px;line-height:1.1;margin-bottom:4px}
+.feat-label{font-size:16px;font-weight:600;margin-bottom:2px}
+.feat-score{font-size:12px;opacity:.6}
+.feat-value{font-size:36px;font-weight:700;line-height:1.1;margin-bottom:2px}
+.feat-unit{font-size:12px;opacity:.6}
+/* 历史 */
+.hist-entry{padding:8px 10px;border-radius:8px;background:#0e1830;margin-top:6px;font-size:13px}
+.hist-text{margin-bottom:4px;opacity:.9}
+.hist-badges{display:flex;flex-wrap:wrap;gap:6px}
+.badge{padding:2px 8px;border-radius:999px;font-size:11px;background:#213160}
+</style></head><body>
+<h1>副语言特征分析</h1>
+<p class="hint">链路：麦克风 → 火山 ASR (副语言全开) → OpenClaw → TTS。副语言特征来自 bigmodel_async 二遍识别。</p>
+<div class="grid2">
+  <div><label>Proxy URL</label><input id="proxyBase" value="http://127.0.0.1:3456"></div>
+  <div><label>Agent ID</label><input id="agentId" value="voice"></div>
+  <div class="checkline"><input id="enableBargeIn" type="checkbox"><label for="enableBargeIn">Barge-in 打断</label></div>
+  <div class="checkline"><input id="injectPara" type="checkbox" checked><label for="injectPara">将副语言注入到 Agent 输入</label></div>
+  <div>
+    <label>Session</label>
+    <div class="session-row">
+      <select id="sessionSelect" style="flex:1"></select>
+      <button class="sm" id="newSessionBtn" type="button">+ 新建</button>
+      <button class="sm" id="delSessionBtn" type="button" style="background:#5a2a2a">删除</button>
+      <button class="sm" id="clearSessionBtn" type="button" style="background:#3a2a1a">清空</button>
+    </div>
+  </div>
+</div>
+<div style="margin-top:12px">
+  <button id="toggleBtn">连接并开始</button>
+  <span class="state" id="state">idle</span>
+</div>
+
+<div class="para-dashboard">
+  <div class="feat-card" id="cardEmotion">
+    <div class="feat-title">情绪</div>
+    <div class="feat-emoji" id="emotionEmoji">❓</div>
+    <div class="feat-label" id="emotionLabel">—</div>
+    <div class="feat-score" id="emotionScore"></div>
+  </div>
+  <div class="feat-card" id="cardGender">
+    <div class="feat-title">性别</div>
+    <div class="feat-emoji" id="genderEmoji">❓</div>
+    <div class="feat-label" id="genderLabel">—</div>
+    <div class="feat-score" id="genderScore"></div>
+  </div>
+  <div class="feat-card">
+    <div class="feat-title">语速</div>
+    <div class="feat-value" id="speechRateEl">—</div>
+    <div class="feat-unit">tokens/s</div>
+  </div>
+  <div class="feat-card">
+    <div class="feat-title">音量</div>
+    <div class="feat-value" id="volumeEl">—</div>
+    <div class="feat-unit">dB</div>
+  </div>
+</div>
+
+<div class="card"><b>ASR（实时）</b><div id="asrPartial" class="mono"></div></div>
+<div class="card"><b>ASR（最终 + 副语言）</b><div id="asrFinal" class="mono"></div></div>
+<div class="card"><b>助手回复</b><div id="reply" class="mono"></div></div>
+<div class="card">
+  <b>历史记录</b>
+  <div id="historyList"></div>
+</div>
+<div class="card"><b>调试日志</b><div id="debug" class="mono"></div></div>
+
+<script>
+const btn = document.getElementById('toggleBtn');
+const stateEl = document.getElementById('state');
+const asrPartialEl = document.getElementById('asrPartial');
+const asrFinalEl = document.getElementById('asrFinal');
+const replyEl = document.getElementById('reply');
+const debugEl = document.getElementById('debug');
+const historyList = document.getElementById('historyList');
+const proxyBaseEl = document.getElementById('proxyBase');
+const agentIdEl = document.getElementById('agentId');
+const enableBargeInEl = document.getElementById('enableBargeIn');
+const injectParaEl = document.getElementById('injectPara');
+const sessionSelect = document.getElementById('sessionSelect');
+const newSessionBtn = document.getElementById('newSessionBtn');
+const delSessionBtn = document.getElementById('delSessionBtn');
+const clearSessionBtn = document.getElementById('clearSessionBtn');
+
+let connected = false, stream, ws, micCtx, source, processor;
+let playCtx = null, nextPlayTime = 0, decodeChain = Promise.resolve(), playerGeneration = 0;
+let activeTurnId = 0;
+
+const EMOTION_META = {
+  angry:    { emoji: '😡', label: '愤怒', bg: '#5a1a1a' },
+  happy:    { emoji: '😄', label: '开心', bg: '#1a4a2a' },
+  neutral:  { emoji: '😐', label: '平静', bg: '#1e2a4a' },
+  sad:      { emoji: '😢', label: '悲伤', bg: '#1a2a5a' },
+  surprise: { emoji: '😲', label: '惊讶', bg: '#3a1a6a' },
+};
+
+function setState(s){ stateEl.textContent = s; }
+function dlog(msg){
+  const t = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+  debugEl.textContent = '[' + t + '] ' + msg + '\\n' + (debugEl.textContent || '');
+}
+function fmtMs(v){ return typeof v === 'number' ? v + 'ms' : '-'; }
+function timeAgo(ts){
+  const s = Math.floor((Date.now()-ts)/1000);
+  if(s<60) return s+'秒前';
+  if(s<3600) return Math.floor(s/60)+'分钟前';
+  return Math.floor(s/3600)+'小时前';
+}
+
+function updateParaDashboard(additions) {
+  if (!additions) return;
+  const emotion = additions.emotion || '';
+  const emotionScore = parseFloat(additions.emotion_score || '0');
+  const emotionDegree = additions.emotion_degree || '';
+  const gender = additions.gender || '';
+  const genderScore = parseFloat(additions.gender_score || '0');
+  const speechRate = parseFloat(additions.speech_rate || '0');
+  const volume = parseFloat(additions.volume || '0');
+
+  const meta = EMOTION_META[emotion];
+  document.getElementById('emotionEmoji').textContent = meta ? meta.emoji : '❓';
+  document.getElementById('emotionLabel').textContent = meta ? meta.label : (emotion || '—');
+  document.getElementById('emotionScore').textContent = emotionScore ? (emotionScore * 100).toFixed(0) + '%' + (emotionDegree ? ' · ' + emotionDegree : '') : '';
+  document.getElementById('cardEmotion').style.background = meta ? meta.bg : '#121f42';
+
+  const genderMeta = gender === 'female' ? { emoji: '♀', label: '女性' } : gender === 'male' ? { emoji: '♂', label: '男性' } : null;
+  document.getElementById('genderEmoji').textContent = genderMeta ? genderMeta.emoji : '❓';
+  document.getElementById('genderEmoji').style.fontSize = '36px';
+  document.getElementById('genderLabel').textContent = genderMeta ? genderMeta.label : (gender || '—');
+  document.getElementById('genderScore').textContent = genderScore ? (genderScore * 100).toFixed(0) + '%' : '';
+  document.getElementById('cardGender').style.background = gender === 'female' ? '#3a1a4a' : gender === 'male' ? '#1a2a4a' : '#121f42';
+
+  document.getElementById('speechRateEl').textContent = speechRate ? speechRate.toFixed(1) : '—';
+  document.getElementById('volumeEl').textContent = volume ? volume.toFixed(1) : '—';
+}
+
+function addHistory(text, additions) {
+  const entry = document.createElement('div');
+  entry.className = 'hist-entry';
+  const textDiv = document.createElement('div');
+  textDiv.className = 'hist-text';
+  textDiv.textContent = text;
+  entry.appendChild(textDiv);
+  if (additions) {
+    const badges = document.createElement('div');
+    badges.className = 'hist-badges';
+    const addBadge = (text, color) => {
+      const b = document.createElement('span');
+      b.className = 'badge';
+      b.textContent = text;
+      if (color) b.style.background = color;
+      badges.appendChild(b);
+    };
+    if (additions.emotion) {
+      const meta = EMOTION_META[additions.emotion];
+      addBadge((meta ? meta.emoji + ' ' + meta.label : additions.emotion) + (additions.emotion_degree ? '·' + additions.emotion_degree : ''), meta ? meta.bg : null);
+    }
+    if (additions.gender) addBadge(additions.gender === 'female' ? '♀ 女性' : '♂ 男性', null);
+    if (additions.speech_rate) addBadge('语速 ' + parseFloat(additions.speech_rate).toFixed(1) + ' t/s', null);
+    if (additions.volume) addBadge('音量 ' + parseFloat(additions.volume).toFixed(0) + ' dB', null);
+    entry.appendChild(badges);
+  }
+  historyList.insertBefore(entry, historyList.firstChild);
+}
+
+async function loadSessions() {
+  const agentId = agentIdEl.value || 'voice';
+  try {
+    const r = await fetch('/api/sessions?agentId=' + encodeURIComponent(agentId));
+    const data = await r.json();
+    const sessions = data.sessions || [];
+    const lastId = data.lastSessionId;
+    sessionSelect.innerHTML = '';
+    if (sessions.length === 0) {
+      const opt = document.createElement('option');
+      opt.value = '';
+      opt.textContent = '（无已保存 session）';
+      sessionSelect.appendChild(opt);
+    } else {
+      sessions.slice().reverse().forEach(s => {
+        const opt = document.createElement('option');
+        opt.value = s.sessionKey;
+        opt.textContent = s.turnCount + '轮 · ' + timeAgo(s.lastUsedAt) + ' · ' + s.sessionKey.slice(-8);
+        opt.dataset.id = s.id;
+        sessionSelect.appendChild(opt);
+      });
+      if (lastId) {
+        const last = sessions.find(s => s.id === lastId);
+        if (last) sessionSelect.value = last.sessionKey;
+      }
+    }
+  } catch(e) { dlog('load sessions failed: ' + e); }
+}
+
+newSessionBtn.addEventListener('click', async () => {
+  const agentId = agentIdEl.value || 'voice';
+  try {
+    const r = await fetch('/api/sessions/new', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ agentId }) });
+    const rec = await r.json();
+    await loadSessions();
+    sessionSelect.value = rec.sessionKey;
+    dlog('新建 session: ' + rec.sessionKey.slice(-8));
+  } catch(e) { dlog('new session failed: ' + e); }
+});
+delSessionBtn.addEventListener('click', async () => {
+  const key = sessionSelect.value;
+  if (!key) return;
+  await fetch('/api/sessions/' + encodeURIComponent(key), { method: 'DELETE' });
+  dlog('删除 session');
+  await loadSessions();
+});
+clearSessionBtn.addEventListener('click', async () => {
+  if (!confirm('清空所有已保存的 session？')) return;
+  const agentId = agentIdEl.value || 'voice';
+  await fetch('/api/sessions?agentId=' + encodeURIComponent(agentId), { method: 'DELETE' });
+  await loadSessions();
+});
+loadSessions();
+
+function floatTo16BitPCM(float32Array){
+  const buf = new ArrayBuffer(float32Array.length * 2);
+  const view = new DataView(buf);
+  for (let i = 0; i < float32Array.length; i++) {
+    let v = Math.max(-1, Math.min(1, float32Array[i]));
+    view.setInt16(i*2, v < 0 ? v * 0x8000 : v * 0x7FFF, true);
+  }
+  return buf;
+}
+function base64ToArrayBuffer(b64){
+  const bin = atob(b64), len = bin.length, bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes.buffer;
+}
+function resetPlayer(){
+  playerGeneration++;
+  nextPlayTime = 0;
+  decodeChain = Promise.resolve();
+  if (playCtx) { playCtx.close().catch(()=>{}); playCtx = null; }
+  playCtx = new (window.AudioContext || window.webkitAudioContext)();
+}
+function enqueueChunk(base64Data){
+  if (!base64Data) return;
+  const arr = base64ToArrayBuffer(base64Data);
+  const gen = playerGeneration;
+  decodeChain = decodeChain.then(async () => {
+    if (!playCtx || gen !== playerGeneration) return;
+    const audioBuf = await playCtx.decodeAudioData(arr.slice(0));
+    if (gen !== playerGeneration) return;
+    if (!nextPlayTime) nextPlayTime = playCtx.currentTime + 0.03;
+    const src = playCtx.createBufferSource();
+    src.buffer = audioBuf;
+    src.connect(playCtx.destination);
+    src.start(nextPlayTime);
+    nextPlayTime += Math.max(0.001, audioBuf.duration - 0.01);
+  }).catch(()=>{});
+}
+
+async function connectAndTalk(){
+  if (connected) return;
+  connected = true;
+  btn.textContent = '断开连接';
+  btn.classList.add('off');
+  setState('connecting');
+  asrPartialEl.textContent = '';
+  asrFinalEl.textContent = '';
+  replyEl.textContent = '';
+  activeTurnId = 0;
+  resetPlayer();
+
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { channelCount: 1, sampleRate: 16000, echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+    });
+  } catch(e) {
+    replyEl.textContent = '麦克风失败: ' + (e && e.message ? e.message : e);
+    disconnect();
+    return;
+  }
+
+  ws = new WebSocket((location.protocol==='https:' ? 'wss://' : 'ws://') + location.host + '/ws/para-claw');
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = () => {
+    dlog('ws open');
+    ws.send(JSON.stringify({
+      type: 'start',
+      codec: 'pcm16le',
+      sampleRate: 16000,
+      proxyBase: proxyBaseEl.value,
+      agentId: agentIdEl.value,
+      enableBargeIn: !!enableBargeInEl.checked,
+      injectPara: !!injectParaEl.checked,
+      sessionKey: sessionSelect.value || '',
+    }));
+    micCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+    source = micCtx.createMediaStreamSource(stream);
+    processor = micCtx.createScriptProcessor(4096, 1, 1);
+    processor.onaudioprocess = (e) => {
+      if (ws && ws.readyState === 1) ws.send(floatTo16BitPCM(e.inputBuffer.getChannelData(0)));
+    };
+    source.connect(processor);
+    processor.connect(micCtx.destination);
+    setState('streaming');
+  };
+
+  ws.onmessage = (evt) => {
+    const msg = JSON.parse(evt.data);
+    if (typeof msg.turnId === 'number') {
+      if (msg.turnId < activeTurnId) return;
+      if (msg.turnId > activeTurnId) { activeTurnId = msg.turnId; replyEl.textContent = ''; resetPlayer(); }
+    }
+    if (msg.type === 'partial') asrPartialEl.textContent = msg.text || '';
+    if (msg.type === 'final') {
+      let label = (msg.text || '');
+      if (msg.additions) {
+        const a = msg.additions;
+        const parts = [];
+        if (a.emotion) parts.push((EMOTION_META[a.emotion] ? EMOTION_META[a.emotion].label : a.emotion) + (a.emotion_degree ? '(' + a.emotion_degree + ')' : ''));
+        if (a.gender) parts.push(a.gender === 'female' ? '♀' : '♂');
+        if (a.speech_rate) parts.push(parseFloat(a.speech_rate).toFixed(1) + 't/s');
+        if (a.volume) parts.push(parseFloat(a.volume).toFixed(0) + 'dB');
+        if (parts.length) label += '  [' + parts.join(' · ') + ']';
+      }
+      asrFinalEl.textContent = label;
+      setState('thinking');
+    }
+    if (msg.type === 'para_features') updateParaDashboard(msg.additions);
+    if (msg.type === 'history_entry') addHistory(msg.text, msg.additions);
+    if (msg.type === 'reply_text') replyEl.textContent += msg.text || '';
+    if (msg.type === 'audio_chunk' && msg.audioChunk) { enqueueChunk(msg.audioChunk); setState('speaking'); }
+    if (msg.type === 'reply_done') {
+      const m = msg.metrics || {};
+      dlog('done [t=' + (msg.turnId||'-') + '] asr→token=' + fmtMs(m.asrToFirstTokenMs) + ' asr→audio=' + fmtMs(m.asrToFirstAudioMs));
+      setState('streaming');
+      loadSessions();
+    }
+    if (msg.type === 'barge_in') {
+      dlog('barge_in');
+      activeTurnId++;
+      resetPlayer();
+      setState('streaming');
+    }
+    if (msg.type === 'error') {
+      replyEl.textContent = '错误: ' + (msg.error || 'unknown');
+      dlog('error: ' + (msg.error || 'unknown'));
+    }
+  };
+
+  ws.onerror = () => dlog('ws error');
+  ws.onclose = () => { dlog('ws close'); if (connected) disconnect(); };
+}
+
+function disconnect(){
+  if (!connected) return;
+  connected = false;
+  try { if (processor) processor.disconnect(); } catch {}
+  try { if (source) source.disconnect(); } catch {}
+  try { if (micCtx) micCtx.close(); } catch {}
+  try { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'stop' })); } catch {}
+  try { if (ws) ws.close(); } catch {}
+  try { if (stream) stream.getTracks().forEach(t => t.stop()); } catch {}
+  btn.textContent = '连接并开始';
+  btn.classList.remove('off');
+  setState('idle');
+}
+
+btn.addEventListener('click', () => {
+  if (connected) disconnect();
+  else connectAndTalk().catch((e) => { replyEl.textContent = '连接失败: ' + (e && e.message ? e.message : e); disconnect(); });
+});
+</script></body></html>`;
+
 // ============ HTTP 服务器 ============
 const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && (req.url === '/lobster' || req.url === '/lobster-half' || req.url === '/phase2-lobster')) {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(lobsterHalfDuplexPage);
+    return;
+  }
+  if (req.method === 'GET' && req.url === '/para') {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(paralinguisticPage);
     return;
   }
   if (req.method === 'GET' && req.url?.startsWith('/api/sessions')) {
@@ -1226,6 +1768,145 @@ const server = http.createServer(async (req, res) => {
 });
 
 const wssPhase2 = new WebSocketServer({ noServer: true });
+
+const wssParaClaw = new WebSocketServer({ noServer: true });
+
+wssParaClaw.on('connection', (client, req) => {
+  console.log('[PARA] ws connected from', req.socket.remoteAddress);
+  let asrSession: ParaAsrSession | null = null;
+  let stopped = false;
+  let turnCounter = 0;
+  let generation = 0;
+  let gw = {
+    proxyBase: 'http://127.0.0.1:3456',
+    agentId: 'voice',
+    enableBargeIn: false,
+    injectPara: true,
+    sessionKey: '',
+  };
+
+  const send = (data: unknown) => {
+    if (client.readyState === WebSocket.OPEN) client.send(JSON.stringify(data));
+  };
+
+  client.on('message', async (raw, isBinary) => {
+    if (!isBinary) {
+      const msg = JSON.parse(raw.toString());
+      if (msg.type === 'start') {
+        stopped = false;
+        turnCounter = 0;
+        gw = {
+          proxyBase: msg.proxyBase || gw.proxyBase,
+          agentId: msg.agentId || gw.agentId,
+          enableBargeIn: !!msg.enableBargeIn,
+          injectPara: msg.injectPara !== false,
+          sessionKey: msg.sessionKey || '',
+        };
+
+        asrSession = new ParaAsrSession(
+          send,
+          async (text: string, additions: any) => {
+            if (stopped) return;
+            const turnId = ++turnCounter;
+            const myGeneration = ++generation;
+            const asrFinalAt = Date.now();
+            let firstTokenAt: number | null = null;
+            let firstSentenceAt: number | null = null;
+            let firstTtsAt: number | null = null;
+            const pendingTts: Promise<void>[] = [];
+            let proxyGatewayFirstDeltaAt: number | null = null;
+            let proxyGatewayFirstDeltaMs: number | null = null;
+
+            // Notify frontend of history entry with features
+            send({ type: 'history_entry', text, additions });
+
+            // Build agent input (optionally inject paralinguistic context)
+            let agentText = text;
+            if (gw.injectPara && additions) {
+              const parts: string[] = [];
+              if (additions.emotion) parts.push('情绪=' + additions.emotion + (additions.emotion_degree ? '(' + additions.emotion_degree + ')' : ''));
+              if (additions.gender) parts.push('性别=' + additions.gender);
+              if (additions.speech_rate) parts.push('语速=' + parseFloat(additions.speech_rate).toFixed(1) + 'token/s');
+              if (additions.volume) parts.push('音量=' + parseFloat(additions.volume).toFixed(0) + 'dB');
+              if (parts.length > 0) agentText = '[副语言: ' + parts.join(', ') + ']\n' + text;
+            }
+
+            try {
+              const handleToken = (token: string) => {
+                if (stopped || myGeneration !== generation) return;
+                if (!firstTokenAt) firstTokenAt = Date.now();
+                send({ type: 'reply_text', turnId, text: token });
+              };
+              const handleSentence = (sentence: string) => {
+                if (!firstSentenceAt) firstSentenceAt = Date.now();
+                const ttsStartAt = Date.now();
+                const ttsPromise = streamTTS(sentence, (chunk) => {
+                  if (stopped || myGeneration !== generation) return;
+                  if (!firstTtsAt) firstTtsAt = Date.now();
+                  send({ type: 'audio_chunk', turnId, audioChunk: chunk.toString('base64') });
+                }).then(() => {}).catch(() => {});
+                pendingTts.push(ttsPromise);
+              };
+
+              await streamChatViaTestServer(
+                agentText,
+                { proxyBase: gw.proxyBase, agentId: gw.agentId, sessionKey: gw.sessionKey },
+                handleToken,
+                handleSentence,
+                (m) => {
+                  if (m.metric === 'gateway_first_delta') {
+                    if (typeof m.at === 'number') proxyGatewayFirstDeltaAt = m.at;
+                    if (typeof m.ms === 'number') proxyGatewayFirstDeltaMs = m.ms;
+                  }
+                }
+              );
+
+              await Promise.all(pendingTts);
+              if (stopped || myGeneration !== generation) return;
+              const replyDoneAt = Date.now();
+              send({
+                type: 'reply_done',
+                turnId,
+                metrics: {
+                  asrFinalAt,
+                  firstTokenAt,
+                  firstSentenceAt,
+                  firstAudioAt: firstTtsAt,
+                  proxyGatewayFirstDeltaAt,
+                  proxyGatewayFirstDeltaMs,
+                  asrToFirstTokenMs: firstTokenAt ? firstTokenAt - asrFinalAt : null,
+                  asrToFirstAudioMs: firstTtsAt ? firstTtsAt - asrFinalAt : null,
+                },
+              });
+              if (gw.sessionKey) touchSession(gw.sessionKey);
+            } catch (e: any) {
+              if (stopped || myGeneration !== generation) return;
+              send({ type: 'error', turnId, error: e.message || String(e) });
+            }
+          },
+          gw.enableBargeIn ? () => { generation++; send({ type: 'barge_in' }); } : undefined
+        );
+        asrSession.start();
+      }
+      if (msg.type === 'stop') {
+        stopped = true;
+        generation++;
+        asrSession?.finish();
+      }
+      return;
+    }
+    if (!stopped) asrSession?.feedPcmChunk(Buffer.from(raw as Buffer));
+  });
+
+  client.on('close', () => {
+    stopped = true;
+    asrSession?.close();
+  });
+
+  client.on('error', (err) => {
+    console.log('[PARA] ws error', (err as any)?.message || err);
+  });
+});
 
 wssPhase2.on('connection', (client, req) => {
   console.log('[PHASE2] ws connected from', req.socket.remoteAddress);
@@ -1400,6 +2081,13 @@ server.on('upgrade', (req, socket, head) => {
   if (pathname === '/ws/phase2-claw') {
     wssPhase2.handleUpgrade(req, socket, head, (ws) => {
       wssPhase2.emit('connection', ws, req);
+    });
+    return;
+  }
+
+  if (pathname === '/ws/para-claw') {
+    wssParaClaw.handleUpgrade(req, socket, head, (ws) => {
+      wssParaClaw.emit('connection', ws, req);
     });
     return;
   }
