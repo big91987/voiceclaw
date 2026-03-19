@@ -15,7 +15,7 @@ export class TtsClient {
   private readyResolve: (() => void) | null = null;
   private readyPromise: Promise<void> | null = null;
   private pendingQueue: { text: string; resolve: () => void; reject: (e: Error) => void }[] = [];
-  private currentJob: { text: string } | null = null;
+  private currentJob: { text: string; resolve: () => void; reject: (e: Error) => void } | null = null;
   private cancelled = false;
 
   constructor() {
@@ -134,7 +134,7 @@ export class TtsClient {
     const job = this.pendingQueue.shift()!;
     console.log(`[TTS] starting synthesis: ${job.text.substring(0, 20)}`);
     this.cancelled = false;
-    this.currentJob = { text: job.text, ...job };
+    this.currentJob = job;
     this.sessionId = uuidv4();
     this.ws?.send(this.makeEvent(100, this.sessionId, {
       user: { uid: uuidv4() },

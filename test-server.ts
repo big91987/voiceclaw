@@ -192,7 +192,7 @@ class GatewayClient {
   async sendAgentMessage(
     message: string,
     agentId: string,
-    opts?: { reuseSession?: boolean; sessionKey?: string },
+    opts?: { reuseSession?: boolean; sessionKey?: string; queueMode?: string },
   ): Promise<{ frame: any; sessionKey: string; runId?: string }> {
     if (!this.ws) throw new Error('Not connected');
 
@@ -333,7 +333,7 @@ const server = createServer(async (req, res) => {
     req.on('data', chunk => body += chunk);
     req.on('end', async () => {
       try {
-        const { message, agentId, reuseSession, sessionKey } = JSON.parse(body);
+        const { message, agentId, reuseSession, sessionKey, queueMode } = JSON.parse(body);
         if (!message) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: 'Message required' }));
@@ -430,6 +430,7 @@ const server = createServer(async (req, res) => {
         const started = await client.sendAgentMessage(message, agentId, {
           reuseSession: !!reuseSession,
           sessionKey: sessionKey || '',
+          queueMode: queueMode || 'interrupt',
         });
         targetRunId = started.runId;
         targetSessionKey = started.sessionKey;

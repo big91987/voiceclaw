@@ -279,10 +279,11 @@ async function streamChatWithOpenClaw(
 
 async function streamChatViaTestServer(
   text: string,
-  opts: { proxyBase?: string; agentId?: string; sessionKey?: string },
+  opts: { proxyBase?: string; agentId?: string; sessionKey?: string; queueMode?: string },
   onToken: (token: string) => void,
   onSentence: (sentence: string) => void,
-  onMetric?: (metric: { metric: string; at?: number; ms?: number }) => void
+  onMetric?: (metric: { metric: string; at?: number; ms?: number }) => void,
+  onTool?: (toolData: { name: string; phase: string; args?: unknown; result?: unknown }) => void
 ): Promise<string> {
   const sentenceBuffer = new SentenceBuffer(onSentence);
   const proxyBase = (opts.proxyBase || 'http://127.0.0.1:3456').replace(/\/$/, '');
@@ -291,7 +292,7 @@ async function streamChatViaTestServer(
   const response = await fetch(`${proxyBase}/api/chat`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ message: text, agentId, sessionKey: opts.sessionKey || '', reuseSession: !!opts.sessionKey }),
+    body: JSON.stringify({ message: text, agentId, sessionKey: opts.sessionKey || '', reuseSession: !!opts.sessionKey, queueMode: opts.queueMode || 'interrupt' }),
   });
 
   if (!response.ok || !response.body) {
@@ -389,6 +390,19 @@ async function streamChatViaTestServer(
           const parsed = JSON.parse(data);
           if (parsed?.type === 'metric' && typeof parsed?.metric === 'string') {
             onMetric?.({ metric: parsed.metric, at: parsed.at, ms: parsed.ms });
+            continue;
+          }
+          // Reset activity timer on any meaningful event (tool calls, lifecycle, etc.)
+          if (!gotFirstToken && firstTokenTimer) {
+            clearTimeout(firstTokenTimer);
+            firstTokenTimer = setTimeout(() => {
+              reject(new Error('Proxy stream timeout: no activity'));
+            }, 15000);
+          }
+          // Forward tool events
+          if (parsed?.event === 'agent' && parsed?.payload?.stream === 'tool') {
+            const d = parsed.payload.data || {};
+            onTool?.({ name: d.name || 'tool', phase: d.phase || '', args: d.args, result: d.result ?? d.partialResult });
             continue;
           }
           const assistantText = extractAssistantText(parsed);
@@ -558,22 +572,34 @@ class TtsConnection {
 
   synthesize(text: string, onChunk: (chunk: Buffer) => void): Promise<void> {
     return new Promise((resolve, reject) => {
+      let settled = false;
+      const onDone = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        resolve();
+      };
+      const onError = (err: Error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        reject(err);
+      };
       const timeout = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        // 清掉卡住的 currentJob，否则队列永远堵塞
+        const idx = this.pendingQueue.findIndex(j => j.onDone === onDone);
+        if (idx >= 0) {
+          this.pendingQueue.splice(idx, 1);
+        } else if (this.currentJob?.onDone === onDone) {
+          this.currentJob = null;
+          this.processQueue();
+        }
         reject(new Error('TTS timeout'));
       }, 30000);
 
-      this.pendingQueue.push({
-        text,
-        onChunk,
-        onDone: () => {
-          clearTimeout(timeout);
-          resolve();
-        },
-        onError: (err) => {
-          clearTimeout(timeout);
-          reject(err);
-        },
-      });
+      this.pendingQueue.push({ text, onChunk, onDone, onError });
       this.processQueue();
     });
   }
@@ -1345,6 +1371,7 @@ select{padding:8px 10px;border-radius:8px;border:1px solid #2f3a63;background:#1
   <div><label>Proxy URL</label><input id="proxyBase" value="http://127.0.0.1:3456"></div>
   <div><label>Agent ID</label><input id="agentId" value="voice"></div>
   <div class="checkline"><input id="enableBargeIn" type="checkbox"><label for="enableBargeIn">Barge-in 打断</label></div>
+  <div><label>Queue Mode</label><select id="queueMode"><option value="interrupt" selected>interrupt（打断当前）</option><option value="collect">collect（排队等待）</option><option value="steer">steer（注入当前）</option></select></div>
   <div class="checkline"><input id="injectPara" type="checkbox" checked><label for="injectPara">将副语言注入到 Agent 输入</label></div>
   <div>
     <label>Session</label>
@@ -1387,6 +1414,7 @@ select{padding:8px 10px;border-radius:8px;border:1px solid #2f3a63;background:#1
 </div>
 
 <div class="card"><b>ASR（实时）</b><div id="asrPartial" class="mono"></div></div>
+<div class="card" id="toolCard" style="display:none"><b>工具调用</b><div id="toolStatus" class="mono"></div></div>
 <div class="card"><b>ASR（最终 + 副语言）</b><div id="asrFinal" class="mono"></div></div>
 <div class="card"><b>助手回复</b><div id="reply" class="mono"></div></div>
 <div class="card">
@@ -1621,6 +1649,7 @@ async function connectAndTalk(){
       enableBargeIn: !!enableBargeInEl.checked,
       injectPara: !!injectParaEl.checked,
       sessionKey: sessionSelect.value || '',
+      queueMode: document.getElementById('queueMode')?.value || 'interrupt',
     }));
     micCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
     source = micCtx.createMediaStreamSource(stream);
@@ -1637,10 +1666,32 @@ async function connectAndTalk(){
     const msg = JSON.parse(evt.data);
     if (typeof msg.turnId === 'number') {
       if (msg.turnId < activeTurnId) return;
-      if (msg.turnId > activeTurnId) { activeTurnId = msg.turnId; replyEl.textContent = ''; resetPlayer(); }
+      if (msg.turnId > activeTurnId) {
+        activeTurnId = msg.turnId;
+        replyEl.textContent = '';
+        resetPlayer();
+        const toolCard = document.getElementById('toolCard');
+        if (toolCard) toolCard.style.display = 'none';
+      }
     }
     if (msg.type === 'partial') asrPartialEl.textContent = msg.text || '';
+    if (msg.type === 'tool_event') {
+      const toolCard = document.getElementById('toolCard');
+      const toolStatus = document.getElementById('toolStatus');
+      if (toolCard && toolStatus) {
+        toolCard.style.display = '';
+        if (msg.phase === 'start') {
+          toolStatus.textContent = '▶ ' + msg.name + (msg.args ? '\\n' + JSON.stringify(msg.args, null, 2) : '');
+          setState('tool:' + msg.name);
+        } else if (msg.phase === 'result') {
+          const out = msg.result ? JSON.stringify(msg.result, null, 2).slice(0, 300) : '';
+          toolStatus.textContent = '✓ ' + msg.name + (out ? '\\n' + out : '');
+        }
+      }
+    }
     if (msg.type === 'final') {
+      const toolCard = document.getElementById('toolCard');
+      if (toolCard) toolCard.style.display = 'none';
       let label = (msg.text || '');
       if (msg.additions) {
         const a = msg.additions;
@@ -1651,6 +1702,7 @@ async function connectAndTalk(){
         if (a.volume) parts.push(parseFloat(a.volume).toFixed(0) + 'dB');
         if (parts.length) label += '  [' + parts.join(' · ') + ']';
       }
+      asrPartialEl.textContent = '';
       asrFinalEl.textContent = label;
       setState('thinking');
     }
@@ -1783,6 +1835,7 @@ wssParaClaw.on('connection', (client, req) => {
     enableBargeIn: false,
     injectPara: true,
     sessionKey: '',
+    queueMode: 'interrupt',
   };
 
   const send = (data: unknown) => {
@@ -1801,6 +1854,7 @@ wssParaClaw.on('connection', (client, req) => {
           enableBargeIn: !!msg.enableBargeIn,
           injectPara: msg.injectPara !== false,
           sessionKey: msg.sessionKey || '',
+          queueMode: msg.queueMode || 'interrupt',
         };
 
         asrSession = new ParaAsrSession(
@@ -1850,7 +1904,7 @@ wssParaClaw.on('connection', (client, req) => {
 
               await streamChatViaTestServer(
                 agentText,
-                { proxyBase: gw.proxyBase, agentId: gw.agentId, sessionKey: gw.sessionKey },
+                { proxyBase: gw.proxyBase, agentId: gw.agentId, sessionKey: gw.sessionKey, queueMode: gw.queueMode },
                 handleToken,
                 handleSentence,
                 (m) => {
@@ -1858,6 +1912,10 @@ wssParaClaw.on('connection', (client, req) => {
                     if (typeof m.at === 'number') proxyGatewayFirstDeltaAt = m.at;
                     if (typeof m.ms === 'number') proxyGatewayFirstDeltaMs = m.ms;
                   }
+                },
+                (toolData) => {
+                  if (stopped || myGeneration !== generation) return;
+                  send({ type: 'tool_event', turnId, ...toolData });
                 }
               );
 
@@ -2003,6 +2061,10 @@ wssPhase2.on('connection', (client, req) => {
                       if (typeof m.at === 'number') proxyGatewayFirstDeltaAt = m.at;
                       if (typeof m.ms === 'number') proxyGatewayFirstDeltaMs = m.ms;
                     }
+                  },
+                  (toolData) => {
+                    if (stopped || myGeneration !== generation) return;
+                    send({ type: 'tool_event', turnId, ...toolData });
                   }
                 );
               }

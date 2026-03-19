@@ -42,7 +42,7 @@ async function main() {
   console.log('[TTS] 初始化...');
   const ttsClient = new TtsClient();
   try {
-    await ttsClient.connect();
+    await ttsClient.waitForReady();
     console.log('[TTS] 已连接');
   } catch (e) {
     console.error('[TTS] 连接失败:', e);
@@ -55,7 +55,7 @@ async function main() {
   // 5. 初始化 SentenceBuffer
   const sentenceBuffer = new SentenceBuffer((sentence) => {
     console.log(`[BUF] 攒够句子: ${sentence}`);
-    ttsClient.synthesize(sentence, uuidv4());
+    ttsClient.synthesize(sentence);
   });
   
   // 6. 初始化 InterruptManager
