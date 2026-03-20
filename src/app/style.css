@@ -1,0 +1,104 @@
+:root {
+  --bg: #1a1a1a; --bg2: #242424; --bg3: #2e2e2e;
+  --text: #e8e8e8; --text2: #999;
+  --accent: #4f9cf9; --danger: #e05555; --success: #52c878;
+  --border: #333;
+  --sidebar-w: 300px;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  background: var(--bg); color: var(--text); height: 100vh;
+  display: flex; flex-direction: column; overflow: hidden;
+}
+
+/* Header */
+#header {
+  display: flex; align-items: center; gap: 12px; padding: 10px 16px;
+  background: var(--bg2); border-bottom: 1px solid var(--border);
+  height: 48px; flex-shrink: 0;
+}
+.brand { font-weight: 600; flex: 1; }
+.dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+.dot--on  { background: var(--success); }
+.dot--off { background: var(--text2); }
+
+/* Main layout */
+#main { display: flex; flex: 1; overflow: hidden; }
+#chat-area { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+#messages {
+  flex: 1; overflow-y: auto; padding: 16px;
+  display: flex; flex-direction: column; gap: 12px;
+}
+
+/* Messages */
+.msg { max-width: 75%; padding: 10px 14px; border-radius: 12px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
+.msg--user      { align-self: flex-end; background: var(--accent); color: #fff; }
+.msg--assistant { align-self: flex-start; background: var(--bg3); }
+.msg--thinking  { color: var(--text2); font-style: italic; font-size: 0.9em; align-self: flex-start; }
+
+/* Sidebar */
+#tasks-sidebar {
+  width: var(--sidebar-w); background: var(--bg2);
+  border-left: 1px solid var(--border); overflow-y: auto;
+  transition: width 0.2s;
+}
+.sidebar--hidden { width: 0 !important; overflow: hidden; }
+#tasks-panel { padding: 12px; }
+.task-node {
+  padding: 6px 8px; border-radius: 6px; font-size: 0.85em;
+  margin-bottom: 4px; background: var(--bg3); cursor: default;
+  border-left: 3px solid transparent;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.task-node--running { border-left-color: var(--accent); }
+.task-node--done    { border-left-color: var(--success); opacity: 0.7; }
+.task-node--error   { border-left-color: var(--danger); }
+.task-node--aborted { border-left-color: var(--text2); opacity: 0.6; }
+
+/* Input bar */
+#input-bar {
+  padding: 10px 16px; background: var(--bg2);
+  border-top: 1px solid var(--border); flex-shrink: 0;
+}
+#input-normal { display: flex; align-items: flex-end; gap: 8px; }
+#text-input {
+  flex: 1; background: var(--bg3); border: 1px solid var(--border);
+  color: var(--text); border-radius: 8px; padding: 8px 12px;
+  resize: none; font-size: 0.95em; max-height: 120px; line-height: 1.4;
+  font-family: inherit;
+}
+#text-input:focus { outline: none; border-color: var(--accent); }
+.btn-icon {
+  background: none; border: none; color: var(--text2); font-size: 1.2em;
+  cursor: pointer; padding: 6px; border-radius: 6px; line-height: 1; flex-shrink: 0;
+}
+.btn-icon:hover { background: var(--bg3); color: var(--text); }
+.btn-icon.active { color: var(--accent); }
+.btn-primary {
+  background: var(--accent); border: none; color: #fff;
+  border-radius: 8px; padding: 8px 14px; cursor: pointer; font-size: 1em; flex-shrink: 0;
+}
+.btn-primary:hover { opacity: 0.85; }
+.btn-danger {
+  background: var(--danger); border: none; color: #fff;
+  border-radius: 8px; padding: 8px 20px; cursor: pointer; font-size: 0.95em;
+}
+.btn-call.active { color: var(--success); }
+
+/* Agent selector */
+#agent-selector select {
+  background: var(--bg3); color: var(--text); border: 1px solid var(--border);
+  border-radius: 6px; padding: 4px 8px; font-size: 0.9em; cursor: pointer;
+}
+
+/* Call mode */
+#input-call {
+  display: flex; align-items: center; justify-content: center;
+  gap: 24px; padding: 8px 0;
+}
+.wave-container { display: flex; align-items: center; gap: 8px; }
+.wave-label { font-size: 0.8em; color: var(--text2); }
+canvas { border-radius: 4px; background: var(--bg3); }
+
+.hidden { display: none !important; }

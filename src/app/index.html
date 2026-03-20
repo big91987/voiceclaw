@@ -1,3 +1,51 @@
 <!DOCTYPE html>
-<html lang="zh"><head><meta charset="UTF-8"><title>OpenClaw</title></head>
-<body><h1>Loading...</h1></body></html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OpenClaw</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- Header -->
+  <header id="header">
+    <span id="status-dot" class="dot dot--off"></span>
+    <span class="brand">OpenClaw</span>
+    <div id="agent-selector"></div>
+    <button id="tasks-toggle" class="btn-icon">任务 ▶</button>
+  </header>
+
+  <!-- Main area -->
+  <div id="main">
+    <div id="chat-area">
+      <div id="messages"></div>
+    </div>
+    <aside id="tasks-sidebar" class="sidebar--hidden">
+      <div id="tasks-panel"></div>
+    </aside>
+  </div>
+
+  <!-- Input bar -->
+  <footer id="input-bar">
+    <!-- Normal mode -->
+    <div id="input-normal">
+      <button id="btn-dictate" class="btn-icon" title="听写">🎤</button>
+      <textarea id="text-input" rows="1" placeholder="输入消息，或点击🎤听写…"></textarea>
+      <button id="btn-send" class="btn-primary">↑</button>
+      <button id="btn-call" class="btn-icon btn-call" title="开始通话">📞</button>
+    </div>
+    <!-- Call mode (hidden by default) -->
+    <div id="input-call" class="hidden">
+      <div class="wave-container">
+        <canvas id="wave-user" width="200" height="60"></canvas>
+        <span class="wave-label">你</span>
+        <span class="wave-label">Agent</span>
+        <canvas id="wave-agent" width="200" height="60"></canvas>
+      </div>
+      <button id="btn-hangup" class="btn-danger">🔴 挂断</button>
+    </div>
+  </footer>
+
+  <script type="module" src="main.js"></script>
+</body>
+</html>
