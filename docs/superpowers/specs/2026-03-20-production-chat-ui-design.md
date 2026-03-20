@@ -138,32 +138,48 @@ OpenClaw Gateway (ws://127.0.0.1:18789)
 
 ## File Structure
 
-```
-src/app/
-  index.html       ← 入口 HTML，引入 main.js (type="module")
-  main.js          ← 初始化、全局状态
-  api.js           ← REST + SSE 数据层
-  voice.js         ← ASR/TTS 管道
-  ui-chat.js       ← 对话消息渲染
-  ui-tasks.js      ← 任务看板
-  ui-agents.js     ← Agent 选择器
-  style.css        ← 全局样式
+完全独立于原有调试工具（test-server.ts / test-page.ts），两套并行运行互不干扰。
 
-test-server.ts     ← 新增 /app/* 静态 serve + /api/events + /api/sessions
+```
+app-server.ts        ← 新独立服务端，port 3100
+src/app/
+  index.html         ← 入口 HTML，引入 main.js (type="module")
+  main.js            ← 初始化、全局状态
+  api.js             ← REST + SSE 数据层
+  voice.js           ← ASR/TTS 管道
+  ui-chat.js         ← 对话消息渲染
+  ui-tasks.js        ← 任务看板
+  ui-agents.js       ← Agent 选择器
+  style.css          ← 全局样式
+
+（保留不动，仅作调试用）
+test-server.ts       ← port 3456
+test-page.ts         ← port 3017
 ```
 
 ---
 
-## test-server.ts 新增端点
+## app-server.ts 端点
 
-### `GET /api/events`
-永久 SSE 连接。将全局 `GatewayClient` 收到的所有事件转发给前端。客户端断开时自动清理 listener。
-
-### `GET /api/sessions`
-参数：`?agentId=voice`（可选）。调用 gateway `sessions.list` 方法，返回 JSON。
+### `GET /`
+返回 `src/app/index.html`
 
 ### `GET /app/*`
-静态文件服务，serve `src/app/` 目录。
+静态文件服务，serve `src/app/` 目录
+
+### `POST /api/chat`
+代理消息到 OpenClaw gateway，SSE 流式返回（与 test-server.ts 逻辑相同）
+
+### `GET /api/events`
+永久 SSE 连接，将 GatewayClient 收到的所有事件转发给前端，客户端断开时清理 listener
+
+### `GET /api/agents`
+调用 gateway `agents.list`，返回 JSON
+
+### `GET /api/sessions`
+参数：`?agentId=`（可选）。调用 gateway `sessions.list`，返回 JSON
+
+GatewayClient（设备认证 + WS 连接）逻辑从 test-server.ts 提取为共享模块 `src/gateway-client.ts`，两个服务端共用。
 
 ---
 
