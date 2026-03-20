@@ -67,6 +67,154 @@ const server = createServer(async (req, res) => {
     return;
   }
 
+  // GET /api/agents
+  if (url === '/api/agents' && req.method === 'GET') {
+    try {
+      const client = await ensureGateway();
+      const result = await client.call('agents.list', {});
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(result));
+    } catch (e) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: String(e) }));
+    }
+    return;
+  }
+
+  // GET /api/sessions
+  if (url.startsWith('/api/sessions') && req.method === 'GET') {
+    const agentId = new URL(url, 'http://x').searchParams.get('agentId') || undefined;
+    try {
+      const client = await ensureGateway();
+      const result = await client.call('sessions.list', agentId ? { agentId } : {});
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(result));
+    } catch (e) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: String(e) }));
+    }
+    return;
+  }
+
+  // GET /api/events — permanent SSE
+  if (url === '/api/events') {
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+    });
+    res.write('data: {"type":"connected"}\n\n');
+    eventSubscribers.add(res);
+    req.on('close', () => eventSubscribers.delete(res));
+    // Ensure gateway is connected so events can flow
+    ensureGateway().catch(e => console.error('[Gateway] events connect failed:', e));
+    return; // keep open
+  }
+
+  // POST /api/chat — SSE stream
+  if (url === '/api/chat' && req.method === 'POST') {
+    let body = '';
+    req.on('data', chunk => body += chunk);
+    req.on('end', async () => {
+      try {
+        const { message, agentId, reuseSession, sessionKey, queueMode } = JSON.parse(body);
+        if (!message) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Message required' })); return;
+        }
+        if (!agentId) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'agentId required' })); return;
+        }
+
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          'Connection': 'keep-alive',
+        });
+
+        const apiStartAt = Date.now();
+        let firstGatewayDeltaAt: number | null = null;
+        let targetRunId: string | undefined;
+        let targetSessionKey: string | undefined;
+
+        const client = await ensureGateway();
+
+        let finished = false;
+        const finish = () => {
+          if (finished) return;
+          finished = true;
+          client.offEvent(eventHandler);
+          res.end();
+        };
+
+        const eventHandler = (event: unknown) => {
+          const e = event as Record<string, unknown>;
+          const payload =
+            e.payload && typeof e.payload === 'object'
+              ? (e.payload as Record<string, unknown>)
+              : {};
+          const eventRunId = typeof payload.runId === 'string' ? payload.runId : '';
+          const eventSessionKey = typeof payload.sessionKey === 'string' ? payload.sessionKey : '';
+          const matchesRun = !!targetRunId && eventRunId === targetRunId;
+          const matchesSession = !!targetSessionKey && eventSessionKey === targetSessionKey;
+          const shouldForward = targetRunId
+            ? (matchesRun || (!eventRunId && matchesSession))
+            : matchesSession;
+
+          if (!shouldForward) return;
+
+          res.write(`data: ${JSON.stringify(e)}\n\n`);
+
+          if (e.event === 'agent') {
+            const stream = payload?.stream;
+            const delta = (payload?.data as Record<string, unknown> | undefined)?.delta;
+            if (stream === 'assistant' && typeof delta === 'string' && delta.length > 0 && !firstGatewayDeltaAt) {
+              firstGatewayDeltaAt = Date.now();
+              const metric = {
+                type: 'metric', metric: 'gateway_first_delta',
+                at: firstGatewayDeltaAt, ms: firstGatewayDeltaAt - apiStartAt,
+              };
+              res.write(`data: ${JSON.stringify(metric)}\n\n`);
+            }
+          }
+
+          if (e.event === 'chat') {
+            if (payload.state === 'final' || payload.state === 'error') {
+              res.write('data: [DONE]\n\n');
+              finish();
+            }
+          }
+        };
+
+        client.onEvent(eventHandler);
+
+        const started = await client.sendAgentMessage(message, agentId, {
+          reuseSession: !!reuseSession,
+          sessionKey: sessionKey || '',
+          queueMode: queueMode || 'interrupt',
+        });
+        targetRunId = started.runId;
+        targetSessionKey = started.sessionKey;
+        res.write(`data: ${JSON.stringify({
+          type: 'metric', metric: 'session_start',
+          runId: targetRunId, sessionKey: targetSessionKey, reuseSession: !!reuseSession,
+        })}\n\n`);
+
+        setTimeout(() => {
+          if (finished) return;
+          res.write('data: [TIMEOUT]\n\n');
+          finish();
+        }, 60000);
+
+      } catch (err) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: String(err) }));
+      }
+    });
+    return;
+  }
+
   // Static files
   const filePath = url === '/'
     ? join(APP_DIR, 'index.html')
