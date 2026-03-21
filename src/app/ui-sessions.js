@@ -1,12 +1,11 @@
 // src/app/ui-sessions.js — session selector dropdown
 import { fetchSessions } from './api.js';
 
-const NEW_SESSION_VALUE = '__new__';
-
 let onChangeCallback = null;
 let currentSessionKey = null;
 let currentAgentId = null;
 let sessionContainerId = null;
+let selElement = null;
 
 export function initSessionSelector(containerId, agentId, onChange) {
   currentAgentId = agentId;
@@ -14,20 +13,19 @@ export function initSessionSelector(containerId, agentId, onChange) {
   onChangeCallback = onChange;
   const container = document.getElementById(containerId);
   container.innerHTML = `
-    <select id="session-select">
-      <option value="${NEW_SESSION_VALUE}">+ 新建 session</option>
-    </select>
+    <select id="session-select"></select>
+    <button id="btn-new-session" class="btn-icon" title="新建 session">+</button>
   `;
-  const sel = container.querySelector('select');
-  sel.addEventListener('change', () => {
-    const value = sel.value;
-    if (value === NEW_SESSION_VALUE) {
-      currentSessionKey = null;
-      onChangeCallback?.(null);
-    } else {
-      currentSessionKey = value;
-      onChangeCallback?.(value);
-    }
+  selElement = container.querySelector('#session-select');
+  selElement.addEventListener('change', () => {
+    const value = selElement.value;
+    currentSessionKey = value || null;
+    onChangeCallback?.(currentSessionKey);
+  });
+  document.getElementById('btn-new-session').addEventListener('click', () => {
+    selElement.value = '';
+    currentSessionKey = null;
+    onChangeCallback?.(null);
   });
   loadSessions(agentId);
 }
@@ -35,30 +33,26 @@ export function initSessionSelector(containerId, agentId, onChange) {
 export async function refreshSessions(agentId) {
   currentAgentId = agentId;
   if (!sessionContainerId) return;
-  const container = document.getElementById(sessionContainerId);
-  const sel = container?.querySelector('select');
-  if (!sel) return;
-  await loadSessions(agentId, sel);
+  await loadSessions(agentId);
 }
 
-async function loadSessions(agentId, sel) {
-  sel = sel || document.getElementById('session-select');
-  if (!sel) return;
-  const newOpt = `<option value="${NEW_SESSION_VALUE}">+ 新建 session</option>`;
+async function loadSessions(agentId) {
+  if (!selElement) return;
+  const newOpt = '<option value="">— 选择 session —</option>';
   try {
     const data = await fetchSessions(agentId);
     const sessions = data?.sessions || [];
     if (sessions.length === 0) {
-      sel.innerHTML = newOpt;
+      selElement.innerHTML = newOpt;
       return;
     }
-    sel.innerHTML = newOpt + sessions.map(s => {
+    selElement.innerHTML = newOpt + sessions.map(s => {
       const label = s.key.split(':').pop();
       return `<option value="${s.key}">${label}</option>`;
     }).join('');
   } catch (err) {
     console.warn('[sessions] load failed:', err);
-    sel.innerHTML = newOpt;
+    selElement.innerHTML = newOpt;
   }
 }
 
