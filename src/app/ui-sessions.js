@@ -48,7 +48,7 @@ async function loadSessions(agentId, sel) {
       return;
     }
     const sessionOpts = sessions.map(s => {
-      const label = s.key.split(':').slice(-2).join(':');
+      const label = s.key.split(':').pop();
       return `<option value="${s.key}">${label}</option>`;
     }).join('');
     sel.innerHTML = newOpt + sessionOpts;
