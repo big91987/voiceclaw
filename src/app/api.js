@@ -69,3 +69,8 @@ export function connectEvents() {
     setTimeout(connectEvents, 3000);
   };
 }
+
+// ── Session events ────────────────────────────────────────
+export function emitSessionChange(sessionKey) {
+  emit('session-change', sessionKey);
+}

@@ -8,7 +8,13 @@ const sidebar = document.getElementById('tasks-sidebar');
 // sessionKey → { key, spawnedBy, status, preview, children[] }
 const nodes = new Map();
 let currentAgentId = null;
+let currentSessionKey = null;
 let sidebarOpen = false;
+
+// Listen to session changes from ui-sessions
+on('session-change', (sessionKey) => {
+  setCurrentSession(sessionKey);
+});
 
 toggleBtn.addEventListener('click', () => {
   sidebarOpen = !sidebarOpen;
@@ -22,10 +28,19 @@ export async function initTasks(agentId) {
   await refresh();
 }
 
+export function setCurrentSession(sessionKey) {
+  currentSessionKey = sessionKey;
+}
+
+export async function refreshTasks() {
+  await refresh();
+}
+
 async function refresh() {
   try {
     const data = await fetchSessions(currentAgentId);
     const sessions = data?.sessions || [];
+    nodes.clear();
     for (const s of sessions) {
       upsertNode(s.key, {
         key: s.key,
@@ -58,7 +73,6 @@ on('agent-event', (event) => {
       render();
     } else if (phase === 'end') {
       upsertNode(key, { key, status: 'done' });
-      // Refresh to pick up new sessions (subagents) that appeared
       refresh();
     } else if (phase === 'error') {
       upsertNode(key, { key, status: 'error' });
@@ -82,24 +96,45 @@ function renderNode(node, depth) {
 
 function render() {
   panel.innerHTML = '';
+
   // Build parent→children links
   for (const node of nodes.values()) node.children = [];
   const roots = [];
-  for (const node of nodes.values()) {
-    if (node.spawnedBy && nodes.has(node.spawnedBy)) {
-      nodes.get(node.spawnedBy).children.push(node.key);
-    } else {
-      roots.push(node);
+
+  if (currentSessionKey) {
+    // B mode: show selected session + its children
+    const target = nodes.get(currentSessionKey);
+    if (target) {
+      // Add all descendants
+      function addDescendants(key) {
+        roots.push(nodes.get(key));
+        for (const [k, n] of nodes) {
+          if (n.spawnedBy === key) addDescendants(k);
+        }
+      }
+      addDescendants(currentSessionKey);
+    }
+  } else {
+    // A mode: show all sessions as roots (no parent) + orphaned children
+    for (const node of nodes.values()) {
+      if (node.spawnedBy && nodes.has(node.spawnedBy)) {
+        nodes.get(node.spawnedBy).children.push(node.key);
+      } else {
+        roots.push(node);
+      }
     }
   }
+
   // Sort: running first
   roots.sort((a, b) => (a.status === 'running' ? -1 : b.status === 'running' ? 1 : 0));
 
-  function renderTree(key, depth) {
-    const node = nodes.get(key);
-    if (!node) return;
+  function renderTree(node, depth) {
     panel.appendChild(renderNode(node, depth));
-    (node.children || []).forEach(c => renderTree(c, depth + 1));
+    (node.children || []).forEach(c => {
+      const child = nodes.get(c);
+      if (child) renderTree(child, depth + 1);
+    });
   }
-  roots.forEach(r => renderTree(r.key, 0));
+
+  roots.forEach(r => renderTree(r, 0));
 }

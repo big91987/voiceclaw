@@ -1,5 +1,5 @@
 // src/app/ui-sessions.js — session selector dropdown
-import { fetchSessions } from './api.js';
+import { fetchSessions, emitSessionChange } from './api.js';
 
 let onChangeCallback = null;
 let currentSessionKey = null;
@@ -21,11 +21,13 @@ export function initSessionSelector(containerId, agentId, onChange) {
     const value = selElement.value;
     currentSessionKey = value || null;
     onChangeCallback?.(currentSessionKey);
+    emitSessionChange(currentSessionKey);
   });
   document.getElementById('btn-new-session').addEventListener('click', () => {
     selElement.value = '';
     currentSessionKey = null;
     onChangeCallback?.(null);
+    emitSessionChange(null);
   });
   loadSessions(agentId);
 }
