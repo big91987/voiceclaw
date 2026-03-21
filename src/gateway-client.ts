@@ -210,7 +210,7 @@ export class GatewayClient {
   async sendAgentMessage(
     message: string,
     agentId: string,
-    opts?: { reuseSession?: boolean; sessionKey?: string; queueMode?: string },
+    opts?: { reuseSession?: boolean; sessionKey?: string },
   ): Promise<{ frame: any; sessionKey: string; runId?: string }> {
     if (!this.ws) throw new Error('Not connected');
 
@@ -237,7 +237,6 @@ export class GatewayClient {
         sessionKey,
         idempotencyKey: uuidv4(),
         deliver: false,
-        ...(opts?.queueMode ? { queueMode: opts.queueMode } : {}),
       },
     };
 

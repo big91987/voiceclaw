@@ -484,13 +484,18 @@ const server = createServer(async (req, res) => {
         let targetRunId: string | undefined;
         let targetSessionKey: string | undefined;
 
-        const client = await ensureGateway();
+        // Each chat request gets its own gateway connection so events route back correctly
+        const device = loadDeviceIdentity();
+        if (!device) throw new Error('Device not paired');
+        const chatClient = new GatewayClient(device);
+        await chatClient.connect();
 
         let finished = false;
         const finish = () => {
           if (finished) return;
           finished = true;
-          client.offEvent(eventHandler);
+          chatClient.offEvent(eventHandler);
+          chatClient.close();
           res.end();
         };
 
@@ -533,12 +538,11 @@ const server = createServer(async (req, res) => {
           }
         };
 
-        client.onEvent(eventHandler);
+        chatClient.onEvent(eventHandler);
 
-        const started = await client.sendAgentMessage(message, agentId, {
+        const started = await chatClient.sendAgentMessage(message, agentId, {
           reuseSession: !!reuseSession,
           sessionKey: sessionKey || '',
-          queueMode: queueMode || 'interrupt',
         });
         targetRunId = started.runId;
         targetSessionKey = started.sessionKey;
