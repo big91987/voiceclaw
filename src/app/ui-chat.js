@@ -11,6 +11,8 @@ export function initChat(onSessionKey) {
 
 export function getCurrentSessionKey() { return currentSessionKey; }
 
+export function clearSessionKey() { currentSessionKey = null; }
+
 export function appendMessage(role, text) {
   const div = document.createElement('div');
   div.className = `msg msg--${role}`;

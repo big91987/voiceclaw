@@ -463,7 +463,7 @@ const server = createServer(async (req, res) => {
     req.on('data', chunk => body += chunk);
     req.on('end', async () => {
       try {
-        const { message, agentId, reuseSession, sessionKey, queueMode } = JSON.parse(body);
+        const { message, agentId, reuseSession, sessionKey } = JSON.parse(body);
         if (!message) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: 'Message required' })); return;
@@ -484,7 +484,7 @@ const server = createServer(async (req, res) => {
         let targetRunId: string | undefined;
         let targetSessionKey: string | undefined;
 
-        // Each chat request gets its own gateway connection so events route back correctly
+        // 每次请求独立连接（避免持久连接切换 agent 时事件串线）
         const device = loadDeviceIdentity();
         if (!device) throw new Error('Device not paired');
         const chatClient = new GatewayClient(device);
@@ -513,7 +513,9 @@ const server = createServer(async (req, res) => {
             ? (matchesRun || (!eventRunId && matchesSession))
             : matchesSession;
 
-          if (!shouldForward) return;
+          if (!shouldForward) {
+            return;
+          }
 
           res.write(`data: ${JSON.stringify(e)}\n\n`);
 

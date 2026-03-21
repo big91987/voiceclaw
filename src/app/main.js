@@ -1,7 +1,7 @@
 // src/app/main.js — entry point: wires all modules together
 import { connectEvents, on, streamChat } from './api.js';
 import { initAgentSelector, getAgentId } from './ui-agents.js';
-import { initChat, sendMessage, getCurrentSessionKey, appendMessage } from './ui-chat.js';
+import { initChat, sendMessage, getCurrentSessionKey, clearSessionKey, appendMessage } from './ui-chat.js';
 import { initTasks } from './ui-tasks.js';
 import { startDictation, stopDictation, speak, stopSpeaking, startCall, stopCall } from './voice.js';
 
@@ -14,6 +14,7 @@ on('gateway-event', (e) => {
 
 // ── Agent selector ─────────────────────────────────────────
 initAgentSelector('agent-selector', (id) => {
+  clearSessionKey(); // 切换 agent 时清空 session，避免路由错乱
   initTasks(id);
 });
 
