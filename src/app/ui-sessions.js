@@ -1,23 +1,27 @@
 // src/app/ui-sessions.js — session selector dropdown
 import { fetchSessions } from './api.js';
 
+const NEW_SESSION_VALUE = '__new__';
+
 let onChangeCallback = null;
 let currentSessionKey = null;
 let currentAgentId = null;
+let sessionContainerId = null;
 
 export function initSessionSelector(containerId, agentId, onChange) {
   currentAgentId = agentId;
+  sessionContainerId = containerId;
   onChangeCallback = onChange;
   const container = document.getElementById(containerId);
   container.innerHTML = `
     <select id="session-select">
-      <option value="__new__">+ 新建 session</option>
+      <option value="${NEW_SESSION_VALUE}">+ 新建 session</option>
     </select>
   `;
   const sel = container.querySelector('select');
   sel.addEventListener('change', () => {
     const value = sel.value;
-    if (value === '__new__') {
+    if (value === NEW_SESSION_VALUE) {
       currentSessionKey = null;
       onChangeCallback?.(null);
     } else {
@@ -30,7 +34,8 @@ export function initSessionSelector(containerId, agentId, onChange) {
 
 export async function refreshSessions(agentId) {
   currentAgentId = agentId;
-  const container = document.getElementById('session-selector');
+  if (!sessionContainerId) return;
+  const container = document.getElementById(sessionContainerId);
   const sel = container?.querySelector('select');
   if (!sel) return;
   await loadSessions(agentId, sel);
@@ -39,20 +44,20 @@ export async function refreshSessions(agentId) {
 async function loadSessions(agentId, sel) {
   sel = sel || document.getElementById('session-select');
   if (!sel) return;
+  const newOpt = `<option value="${NEW_SESSION_VALUE}">+ 新建 session</option>`;
   try {
     const data = await fetchSessions(agentId);
     const sessions = data?.sessions || [];
-    const newOpt = '<option value="__new__">+ 新建 session</option>';
     if (sessions.length === 0) {
       sel.innerHTML = newOpt;
       return;
     }
-    const sessionOpts = sessions.map(s => {
+    sel.innerHTML = newOpt + sessions.map(s => {
       const label = s.key.split(':').pop();
       return `<option value="${s.key}">${label}</option>`;
     }).join('');
-    sel.innerHTML = newOpt + sessionOpts;
-  } catch {
+  } catch (err) {
+    console.warn('[sessions] load failed:', err);
     sel.innerHTML = newOpt;
   }
 }
