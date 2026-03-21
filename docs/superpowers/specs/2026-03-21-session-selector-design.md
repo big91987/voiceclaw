@@ -11,10 +11,10 @@
 ### 下拉框内容
 
 - 顶部固定项：`+ 新建 session`
-- 已有 session：`sessionKey — lastMessagePreview`（sessionKey 截取后缀部分）
+- 已有 session：`sessionKey 后缀`（如 `web-sticky-xxx`）
 - 无 session 时：只显示 `+ 新建 session`
 
-> 注意：`sessionKey` 完整形如 `agent:voice:web-sticky-xxx`，展示时取后缀（如 `web-sticky-xxx`）或完整 key 均可，以可读为准。
+> 注：gateway sessions.list 不返回 `lastMessagePreview`，只显示 session key 可读后缀。
 
 ### 交互逻辑
 
@@ -38,7 +38,11 @@
 ### 验收标准
 
 - 切换 agent 后，下拉框显示该 agent 拥有的 session
-- 选择已有 session，聊天区清空并加载历史消息
-- 选择新建，生成新 session，清空聊天区
+- 选择已有 session，session key 被记录，下一条消息路由到该 session
+- 选择新建，生成新 session
 - 网络失败时显示"加载失败"提示，不崩溃
 - 无 session 时只显示新建项
+
+### 后续功能
+
+- 加载历史消息（需要 gateway 提供 history API，属于独立任务）
