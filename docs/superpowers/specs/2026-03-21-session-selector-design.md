@@ -21,8 +21,8 @@
 | 操作 | 行为 |
 |------|------|
 | 切换 agent | 清空当前 session，下拉框刷新为新 agent 的 session 列表，等待手动选择 |
-| 选择已有 session | 加载该 session 历史消息，清空聊天区后显示历史 |
-| 选择"新建 session" | 创建新 session，清空聊天区 |
+| 选择已有 session | 记录 session key，下一条消息路由到该 session（历史消息加载：后续任务） |
+| 选择"新建 session" | 清空聊天区，新 session |
 | 无 session 时 | 只显示"+ 新建 session" |
 
 ### API
@@ -39,7 +39,7 @@
 
 - 切换 agent 后，下拉框显示该 agent 拥有的 session
 - 选择已有 session，session key 被记录，下一条消息路由到该 session
-- 选择新建，生成新 session
+- 选择新建，聊天区清空，生成新 session
 - 网络失败时显示"加载失败"提示，不崩溃
 - 无 session 时只显示新建项
 
