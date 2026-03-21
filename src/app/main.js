@@ -1,8 +1,9 @@
 // src/app/main.js — entry point: wires all modules together
 import { connectEvents, on, streamChat } from './api.js';
 import { initAgentSelector, getAgentId } from './ui-agents.js';
-import { initChat, sendMessage, getCurrentSessionKey, clearSessionKey, appendMessage } from './ui-chat.js';
+import { initChat, sendMessage, getCurrentSessionKey, appendMessage } from './ui-chat.js';
 import { initTasks } from './ui-tasks.js';
+import { initSessionSelector, getSessionKey, clearSessionKey, refreshSessions } from './ui-sessions.js';
 import { startDictation, stopDictation, speak, stopSpeaking, startCall, stopCall } from './voice.js';
 
 // ── Status dot ─────────────────────────────────────────────
@@ -13,9 +14,16 @@ on('gateway-event', (e) => {
 });
 
 // ── Agent selector ─────────────────────────────────────────
-initAgentSelector('agent-selector', (id) => {
+initAgentSelector('agent-selector', async (id) => {
   clearSessionKey(); // 切换 agent 时清空 session，避免路由错乱
   initTasks(id);
+  await refreshSessions(id);
+});
+
+initSessionSelector('session-selector', getAgentId(), (sessionKey) => {
+  if (sessionKey === null) {
+    document.getElementById('messages').innerHTML = '';
+  }
 });
 
 // ── Chat ───────���───────────────────────────────────────────
@@ -37,7 +45,7 @@ async function handleSend() {
     text,
     agentId: getAgentId(),
     reuseSession: true,
-    sessionKey: getCurrentSessionKey(),
+    sessionKey: getSessionKey() ?? getCurrentSessionKey(),
   });
 }
 
