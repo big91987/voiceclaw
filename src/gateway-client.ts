@@ -236,6 +236,10 @@ export class GatewayClient {
     return this.call('chat.abort', { sessionKey, runId });
   }
 
+  async patchSession(sessionKey: string, patch: Record<string, unknown>): Promise<unknown> {
+    return this.call('sessions.patch', { key: sessionKey, ...patch });
+  }
+
   async sendAgentMessage(
     message: string,
     agentId: string,
@@ -268,6 +272,9 @@ export class GatewayClient {
         deliver: false,
       },
     };
+
+    // ensure tool results are included in events
+    await this.patchSession(sessionKey, { verboseLevel: 'full' }).catch(() => {});
 
     return new Promise((resolve) => {
       this.pendingResolves.set(id, (frame: any) => {
