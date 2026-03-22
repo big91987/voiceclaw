@@ -134,6 +134,7 @@ canvas { border-radius: 4px; background: var(--bg3); }
 /* Tool call bubbles */
 .msg--tool {
   align-self: flex-start;
+  flex-shrink: 0;
   background: #242424;
   border: 1px solid #3a3a3a;
   border-radius: 8px;
@@ -141,6 +142,7 @@ canvas { border-radius: 4px; background: var(--bg3); }
   overflow: hidden;
   font-size: 13px;
   cursor: default;
+  padding: 0;
 }
 .tool-summary {
   display: flex;

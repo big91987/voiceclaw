@@ -53,6 +53,7 @@ export async function sendMessage({ text, agentId, reuseSession, sessionKey, que
 
   const thinking = appendMessage('thinking', '...');
   thinking.classList.add('msg--thinking');
+  thinking.dataset.currentTurn = '1';  // marker so tool bubbles can insert before it
   let fullText = '';
 
   try {
@@ -88,4 +89,5 @@ export async function sendMessage({ text, agentId, reuseSession, sessionKey, que
   if (!fullText && thinking.parentNode) {
     thinking.remove();
   }
+  delete thinking.dataset.currentTurn;
 }

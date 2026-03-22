@@ -47,7 +47,13 @@ export async function* streamChat({ message, agentId, sessionKey, reuseSession, 
         if (!part.startsWith('data: ')) continue;
         const raw = part.slice(6).trim();
         if (raw === '[DONE]' || raw === '[TIMEOUT]') { yield { done: true }; return; }
-        try { yield JSON.parse(raw); } catch {}
+        try {
+          const parsed = JSON.parse(raw);
+          if (parsed.event === 'agent' && parsed.payload?.stream === 'tool') {
+            emit('agent-event', parsed);
+          }
+          yield parsed;
+        } catch {}
       }
     }
   } finally {
@@ -65,7 +71,8 @@ export function connectEvents() {
     try {
       const data = JSON.parse(e.data);
       emit('gateway-event', data);
-      if (data.event === 'agent') emit('agent-event', data);
+      // only emit lifecycle/other agent events from global SSE; tool events come via streamChat to avoid duplicates
+      if (data.event === 'agent' && data.payload?.stream !== 'tool') emit('agent-event', data);
       if (data.event === 'chat')  emit('chat-event', data);
     } catch {}
   };

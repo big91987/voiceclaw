@@ -139,10 +139,13 @@ btnCall.addEventListener('click', async () => {
   let currentAc = null;
   let currentRunId = null;
   let currentSessionKey = null;
+  let callSessionKey = getCurrentSessionKey(); // sticky session across call turns
+  let generation = 0;
 
   await startCall(
     async (text) => {
       // Voice final → send to agent, stream reply, speak it
+      const myGeneration = ++generation;
       appendMessage('user', text);
       let reply = '';
       const thinking = appendMessage('assistant', '...');
@@ -154,16 +157,18 @@ btnCall.addEventListener('click', async () => {
         for await (const ev of streamChat({
           message: text,
           agentId: getAgentId(),
-          sessionKey: getCurrentSessionKey(),
+          sessionKey: callSessionKey,
           reuseSession: true,
           queueMode: 'interrupt',
           signal: ac.signal,
         })) {
+          if (myGeneration !== generation) break; // barged-in, discard
           if (ev.done) break;
           // Track the run so barge-in can abort it
           if (ev.type === 'metric' && ev.metric === 'session_start') {
             currentRunId = ev.runId;
             currentSessionKey = ev.sessionKey;
+            if (!callSessionKey) callSessionKey = ev.sessionKey; // sticky for subsequent turns
           }
           if (ev.event === 'agent' && ev.payload?.stream === 'assistant') {
             const d = ev.payload?.data?.delta;
@@ -184,11 +189,22 @@ btnCall.addEventListener('click', async () => {
 
       currentAc = null;
       currentRunId = null;
+
+      // Stale check: barge-in happened during this turn
+      if (myGeneration !== generation) {
+        if (thinking.parentNode) {
+          thinking.classList.remove('msg--thinking');
+          thinking.className = 'msg msg--assistant';
+          thinking.textContent = (reply || '...') + '（被打断）';
+        }
+        return;
+      }
       if (!reply && thinking.parentNode) thinking.remove();
       if (reply) await speak(reply);
     },
     async () => {
-      // barge-in: abort gateway run + stop SSE stream + stop TTS
+      // barge-in: bump generation, abort gateway run + SSE stream + TTS
+      generation++;
       stopSpeaking();
       if (currentRunId && currentSessionKey) {
         try {

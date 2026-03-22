@@ -145,7 +145,7 @@ function render() {
 
 function createToolBubble(toolCallId, name) {
   const wrap = document.createElement('div');
-  wrap.className = 'msg msg--tool';
+  wrap.className = 'msg--tool';
   wrap.dataset.toolCallId = toolCallId;
 
   const summary = document.createElement('div');
@@ -179,7 +179,6 @@ function createToolBubble(toolCallId, name) {
 // Second on('agent-event') handler for tool stream — safe to register alongside the lifecycle handler above
 on('agent-event', (event) => {
   const payload = event.payload || {};
-  if (payload.stream !== 'tool') return;
 
   const data = payload.data || {};
   const { toolCallId, name, phase, args, result } = data;
@@ -190,7 +189,13 @@ on('agent-event', (event) => {
     // cache args from start event — result event may not carry them
     toolCallMap.set(toolCallId, { ...els, cachedArgs: args });
     if (messagesEl) {
-      messagesEl.appendChild(els.wrap);
+      // insert before the current-turn assistant bubble so tools appear above the reply
+      const turnEl = messagesEl.querySelector('[data-current-turn]');
+      if (turnEl) {
+        messagesEl.insertBefore(els.wrap, turnEl);
+      } else {
+        messagesEl.appendChild(els.wrap);
+      }
       messagesEl.scrollTop = messagesEl.scrollHeight;
     }
   } else if (phase === 'result') {

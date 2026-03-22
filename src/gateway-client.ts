@@ -197,7 +197,7 @@ export class GatewayClient {
         minProtocol: 3, maxProtocol: 3,
         client: { id: clientId, version: '1.0.0', platform: 'darwin', mode: clientMode },
         auth: { token: this.device.gatewayToken },
-        role, scopes, caps: [],
+        role, scopes, caps: ['tool-events'],
         device: {
           id: this.device.deviceId,
           publicKey: this.device.publicKeyPem,
