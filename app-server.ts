@@ -772,14 +772,8 @@ async function parseSessionHistory(filePath: string): Promise<any[]> {
       try {
         const obj = JSON.parse(line);
         if (obj.type === 'message' && obj.message) {
-          const { role, content, timestamp } = obj.message;
-          // Skip tool-related roles entirely
-          if (role === 'toolResult' || role === 'tool') return;
-          // For user/assistant: only include if there's at least one text block
-          const contentArr = Array.isArray(content) ? content : [];
-          const hasText = contentArr.some((c: any) => c?.type === 'text');
-          if (!hasText && typeof content !== 'string') return;
-          messages.push({ role, content, timestamp });
+          const { role, content, timestamp, toolCallId, toolName } = obj.message;
+          messages.push({ role, content, timestamp, toolCallId, toolName });
         }
       } catch {}
     });

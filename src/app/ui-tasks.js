@@ -176,6 +176,21 @@ function createToolBubble(toolCallId, name) {
   return { wrap, dot, status, detail };
 }
 
+// Static tool bubble for history replay
+export function appendStaticToolBubble(name, args, result) {
+  const { wrap, dot, status, detail } = createToolBubble('history-' + name + '-' + Date.now(), name);
+  dot.className = 'tool-dot done';
+  status.textContent = '完成 · 点击展开';
+  const argsDiv = document.createElement('div');
+  argsDiv.className = 'tool-detail-args';
+  argsDiv.textContent = args !== undefined ? 'args: ' + JSON.stringify(args, null, 2) : '';
+  const resultDiv = document.createElement('div');
+  resultDiv.className = 'tool-detail-result';
+  resultDiv.textContent = result !== undefined ? '\nresult: ' + (typeof result === 'string' ? result : JSON.stringify(result, null, 2)) : '';
+  detail.append(argsDiv, resultDiv);
+  if (messagesEl) messagesEl.appendChild(wrap);
+}
+
 // Second on('agent-event') handler for tool stream — safe to register alongside the lifecycle handler above
 on('agent-event', (event) => {
   const payload = event.payload || {};

@@ -1,5 +1,6 @@
 // src/app/ui-chat.js — conversation messages + streaming assistant replies
 import { streamChat, fetchChatHistory, getOpenClawPath, on } from './api.js';
+import { appendStaticToolBubble } from './ui-tasks.js';
 
 const messagesEl = document.getElementById('messages');
 let currentSessionKey = null;
@@ -24,10 +25,36 @@ async function loadHistory(agentId, sessionId) {
     const openclawPath = getOpenClawPath();
     const data = await fetchChatHistory(agentId, sessionId, openclawPath);
     const messages = data?.messages || [];
+
+    // Build toolCallId → result text map from toolResult messages
+    const toolResults = new Map();
     for (const msg of messages) {
+      if (msg.role === 'toolResult' && msg.toolCallId) {
+        const content = msg.content;
+        const text = Array.isArray(content)
+          ? content.find(c => c.type === 'text')?.text
+          : (typeof content === 'string' ? content : undefined);
+        toolResults.set(msg.toolCallId, text);
+      }
+    }
+
+    for (const msg of messages) {
+      if (msg.role === 'toolResult') continue; // rendered via toolCall pairing
+
       const content = msg.content;
-      const text = Array.isArray(content) ? content.find(c => c.type === 'text')?.text : (typeof content === 'string' ? content : '');
-      if (text) appendMessage(msg.role, text);
+      if (Array.isArray(content)) {
+        for (const block of content) {
+          if (block.type === 'text' && block.text) {
+            appendMessage(msg.role, block.text);
+          } else if (block.type === 'toolCall') {
+            const result = toolResults.get(block.id);
+            appendStaticToolBubble(block.name, block.arguments, result);
+          }
+          // skip 'thinking' blocks
+        }
+      } else if (typeof content === 'string' && content) {
+        appendMessage(msg.role, content);
+      }
     }
   } catch (e) {
     console.warn('[chat] load history failed:', e);
