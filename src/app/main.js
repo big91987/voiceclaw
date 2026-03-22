@@ -136,6 +136,10 @@ btnCall.addEventListener('click', async () => {
   inputCall.classList.remove('hidden');
   btnCall.classList.add('active');
 
+  let currentAc = null;
+  let currentRunId = null;
+  let currentSessionKey = null;
+
   await startCall(
     async (text) => {
       // Voice final → send to agent, stream reply, speak it
@@ -143,6 +147,8 @@ btnCall.addEventListener('click', async () => {
       let reply = '';
       const thinking = appendMessage('assistant', '...');
       thinking.classList.add('msg--thinking');
+      const ac = new AbortController();
+      currentAc = ac;
 
       try {
         for await (const ev of streamChat({
@@ -151,8 +157,14 @@ btnCall.addEventListener('click', async () => {
           sessionKey: getCurrentSessionKey(),
           reuseSession: true,
           queueMode: 'interrupt',
+          signal: ac.signal,
         })) {
           if (ev.done) break;
+          // Track the run so barge-in can abort it
+          if (ev.type === 'metric' && ev.metric === 'session_start') {
+            currentRunId = ev.runId;
+            currentSessionKey = ev.sessionKey;
+          }
           if (ev.event === 'agent' && ev.payload?.stream === 'assistant') {
             const d = ev.payload?.data?.delta;
             if (d) {
@@ -167,13 +179,28 @@ btnCall.addEventListener('click', async () => {
           }
         }
       } catch (err) {
-        console.error('[call] streamChat error:', err);
+        if (err.name !== 'AbortError') console.error('[call] streamChat error:', err);
       }
 
+      currentAc = null;
+      currentRunId = null;
       if (!reply && thinking.parentNode) thinking.remove();
       if (reply) await speak(reply);
     },
-    () => { /* barge-in: stopSpeaking already called inside voice.js */ },
+    async () => {
+      // barge-in: abort gateway run + stop SSE stream + stop TTS
+      stopSpeaking();
+      if (currentRunId && currentSessionKey) {
+        try {
+          await fetch('/api/chat/abort', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ runId: currentRunId, sessionKey: currentSessionKey }),
+          });
+        } catch {}
+      }
+      currentAc?.abort();
+    },
   );
 });
 

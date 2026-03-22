@@ -658,6 +658,25 @@ const server = createServer(async (req, res) => {
     return;
   }
 
+  // POST /api/chat/abort — abort an in-flight chat run
+  if (url === '/api/chat/abort' && req.method === 'POST') {
+    let body = '';
+    req.on('data', chunk => body += chunk);
+    req.on('end', async () => {
+      try {
+        const { runId, sessionKey } = JSON.parse(body);
+        const client = await ensureGateway();
+        const result = await client.abortRun(sessionKey, runId);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result));
+      } catch (e) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: String(e) }));
+      }
+    });
+    return;
+  }
+
   // Static files
   const filePath = url === '/'
     ? join(APP_DIR, 'index.html')

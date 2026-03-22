@@ -232,6 +232,10 @@ export class GatewayClient {
     });
   }
 
+  async abortRun(sessionKey: string, runId: string): Promise<unknown> {
+    return this.call('chat.abort', { sessionKey, runId });
+  }
+
   async sendAgentMessage(
     message: string,
     agentId: string,

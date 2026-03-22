@@ -26,7 +26,7 @@ export async function fetchSessions(agentId) {
   return r.json();
 }
 
-export async function* streamChat({ message, agentId, sessionKey, reuseSession, queueMode }) {
+export async function* streamChat({ message, agentId, sessionKey, reuseSession, queueMode, signal }) {
   const r = await fetch('/api/chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -35,18 +35,23 @@ export async function* streamChat({ message, agentId, sessionKey, reuseSession, 
   const reader = r.body.getReader();
   const dec = new TextDecoder();
   let buf = '';
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += dec.decode(value, { stream: true });
-    const parts = buf.split('\n\n');
-    buf = parts.pop();
-    for (const part of parts) {
-      if (!part.startsWith('data: ')) continue;
-      const raw = part.slice(6).trim();
-      if (raw === '[DONE]' || raw === '[TIMEOUT]') { yield { done: true }; return; }
-      try { yield JSON.parse(raw); } catch {}
+  try {
+    while (true) {
+      if (signal?.aborted) break;
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      const parts = buf.split('\n\n');
+      buf = parts.pop();
+      for (const part of parts) {
+        if (!part.startsWith('data: ')) continue;
+        const raw = part.slice(6).trim();
+        if (raw === '[DONE]' || raw === '[TIMEOUT]') { yield { done: true }; return; }
+        try { yield JSON.parse(raw); } catch {}
+      }
     }
+  } finally {
+    reader.cancel();
   }
 }
 
@@ -90,6 +95,15 @@ export function setOpenClawPath(path) {
 export async function fetchSessionsFromOpenClaw(agentId, openclawPath) {
   const url = `/api/openclaw/sessions?agentId=${encodeURIComponent(agentId)}&openclawPath=${encodeURIComponent(openclawPath)}`;
   const r = await fetch(url);
+  return r.json();
+}
+
+export async function abortChat(runId, sessionKey) {
+  const r = await fetch('/api/chat/abort', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ runId, sessionKey }),
+  });
   return r.json();
 }
 
