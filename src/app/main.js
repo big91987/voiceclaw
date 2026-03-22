@@ -166,7 +166,9 @@ btnCall.addEventListener('click', async () => {
             }
           }
         }
-      } catch {}
+      } catch (err) {
+        console.error('[call] streamChat error:', err);
+      }
 
       if (!reply && thinking.parentNode) thinking.remove();
       if (reply) await speak(reply);

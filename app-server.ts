@@ -38,7 +38,8 @@ let gatewayClient: GatewayClient | null = null;
 let gatewayReady = false;
 
 async function ensureGateway(): Promise<GatewayClient> {
-  if (gatewayClient && gatewayReady) return gatewayClient;
+  if (gatewayClient && gatewayReady && gatewayClient.isConnected()) return gatewayClient;
+  gatewayReady = false;
   const device = loadDeviceIdentity();
   if (!device) throw new Error('Device not paired');
   const client = new GatewayClient(device);
@@ -52,6 +53,8 @@ async function ensureGateway(): Promise<GatewayClient> {
       try { sub.write(data); } catch { eventSubscribers.delete(sub); }
     }
   });
+  // Handle disconnect → reset so next call reconnects
+  client.onClose(() => { gatewayReady = false; });
   return gatewayClient;
 }
 

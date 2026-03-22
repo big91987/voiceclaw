@@ -108,6 +108,7 @@ export class GatewayClient {
   private reqId = 0;
   private agentSessionKeys = new Map<string, string>();
   private eventHandlers: ((event: unknown) => void)[] = [];
+  private closeHandlers: (() => void)[] = [];
 
   constructor(device: DeviceIdentity) {
     this.device = device;
@@ -136,6 +137,7 @@ export class GatewayClient {
       this.ws.on('error', reject);
       this.ws.on('close', () => {
         console.log('[WS] Closed');
+        this.closeHandlers.forEach(h => h());
       });
     });
   }
@@ -278,6 +280,14 @@ export class GatewayClient {
 
   offEvent(handler: (event: unknown) => void) {
     this.eventHandlers = this.eventHandlers.filter(h => h !== handler);
+  }
+
+  onClose(handler: () => void) {
+    this.closeHandlers.push(handler);
+  }
+
+  isConnected(): boolean {
+    return this.ws?.readyState === WebSocket.OPEN;
   }
 
   close() {
