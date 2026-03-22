@@ -74,3 +74,27 @@ export function connectEvents() {
 export function emitSessionChange(sessionKey) {
   emit('session-change', sessionKey);
 }
+
+// ── OpenClaw path config ──────────────────────────────────
+export const DEFAULT_OPENCLAW_PATH = '~/.openclaw';
+
+export function getOpenClawPath() {
+  return localStorage.getItem('openclawPath') || DEFAULT_OPENCLAW_PATH;
+}
+
+export function setOpenClawPath(path) {
+  localStorage.setItem('openclawPath', path);
+}
+
+// ── OpenClaw session file APIs ─────────────────────────────
+export async function fetchSessionsFromOpenClaw(agentId, openclawPath) {
+  const url = `/api/openclaw/sessions?agentId=${encodeURIComponent(agentId)}&openclawPath=${encodeURIComponent(openclawPath)}`;
+  const r = await fetch(url);
+  return r.json();
+}
+
+export async function fetchChatHistory(agentId, sessionId, openclawPath) {
+  const url = `/api/openclaw/history?agentId=${encodeURIComponent(agentId)}&sessionId=${encodeURIComponent(sessionId)}&openclawPath=${encodeURIComponent(openclawPath)}`;
+  const r = await fetch(url);
+  return r.json();
+}

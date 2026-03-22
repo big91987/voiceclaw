@@ -11,6 +11,10 @@
   <header id="header">
     <span id="status-dot" class="dot dot--off"></span>
     <span class="brand">OpenClaw</span>
+    <div id="tab-bar">
+      <button id="tab-chat" class="tab-btn tab-btn--active">对话</button>
+      <button id="tab-settings" class="tab-btn">设置</button>
+    </div>
     <div id="agent-selector"></div>
     <div id="session-selector"></div>
     <button id="tasks-toggle" class="btn-icon">任务 ▶</button>
@@ -18,8 +22,21 @@
 
   <!-- Main area -->
   <div id="main">
+    <!-- Chat view -->
     <div id="chat-area">
       <div id="messages"></div>
+    </div>
+    <!-- Settings view -->
+    <div id="settings-panel" class="hidden">
+      <h2>设置</h2>
+      <div class="settings-group">
+        <label for="settings-path">OpenClaw 配置路径</label>
+        <div class="settings-row">
+          <input id="settings-path" type="text" placeholder="~/.openclaw" />
+          <button id="btn-save-path" class="btn-primary">保存</button>
+        </div>
+        <p class="settings-hint">指向 OpenClaw 的配置目录，里面有 agents/ 文件夹</p>
+      </div>
     </div>
     <aside id="tasks-sidebar" class="sidebar--hidden">
       <div id="tasks-panel"></div>

@@ -1,5 +1,5 @@
 // src/app/ui-chat.js — conversation messages + streaming assistant replies
-import { streamChat } from './api.js';
+import { streamChat, fetchChatHistory, getOpenClawPath, on } from './api.js';
 
 const messagesEl = document.getElementById('messages');
 let currentSessionKey = null;
@@ -7,6 +7,31 @@ let onSessionKeyCallback = null;
 
 export function initChat(onSessionKey) {
   onSessionKeyCallback = onSessionKey;
+
+  // Load history when session changes
+  on('session-change', async (sessionId) => {
+    currentSessionKey = sessionId;
+    messagesEl.innerHTML = '';
+    if (sessionId) {
+      const agentId = document.getElementById('agent-select')?.value;
+      if (agentId) await loadHistory(agentId, sessionId);
+    }
+  });
+}
+
+async function loadHistory(agentId, sessionId) {
+  try {
+    const openclawPath = getOpenClawPath();
+    const data = await fetchChatHistory(agentId, sessionId, openclawPath);
+    const messages = data?.messages || [];
+    for (const msg of messages) {
+      const content = msg.content;
+      const text = Array.isArray(content) ? content.find(c => c.type === 'text')?.text : (typeof content === 'string' ? content : '');
+      if (text) appendMessage(msg.role, text);
+    }
+  } catch (e) {
+    console.warn('[chat] load history failed:', e);
+  }
 }
 
 export function getCurrentSessionKey() { return currentSessionKey; }

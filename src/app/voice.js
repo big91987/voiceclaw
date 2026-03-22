@@ -8,7 +8,15 @@ let vadThreshold = 0.01; // raised during TTS to reduce echo
 export function setVadThreshold(v) { vadThreshold = v; }
 
 async function openMic() {
-  micStream = await navigator.mediaDevices.getUserMedia({ audio: { sampleRate: 16000, channelCount: 1 } });
+  micStream = await navigator.mediaDevices.getUserMedia({
+    audio: {
+      sampleRate: 16000,
+      channelCount: 1,
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+    }
+  });
   audioCtx = new AudioContext({ sampleRate: 16000 });
   const src = audioCtx.createMediaStreamSource(micStream);
   processor = audioCtx.createScriptProcessor(4096, 1, 1);
@@ -27,9 +35,19 @@ function closeMic() {
 function connectAsrWs(onMessage) {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const ws = new WebSocket(`${proto}://${location.host}/ws/asr`);
+  console.log('[voice] ASR WS connecting to', ws.url);
   ws.binaryType = 'arraybuffer';
-  ws.onmessage = (e) => { try { onMessage(JSON.parse(e.data)); } catch {} };
-  ws.onerror = () => ws.close();
+  ws.onopen = () => console.log('[voice] ASR WS open');
+  ws.onmessage = (e) => { try { onMessage(JSON.parse(e.data)); } catch { console.log('[voice] ASR parse error', e.data); } };
+  ws.onerror = (e) => console.log('[voice] ASR WS error', e);
+  ws.onclose = (e) => {
+    console.log('[voice] ASR WS close', e.code, e.reason);
+    // Auto-reconnect if still in call
+    if (calling) {
+      console.log('[voice] ASR WS reconnecting...');
+      asrWs = connectAsrWs(onMessage);
+    }
+  };
   return ws;
 }
 
@@ -89,6 +107,8 @@ export function isSpeaking() { return !!ttsAudio && !ttsAudio.paused; }
 
 // ── Call mode ──────────────────────────────────────────────
 let calling = false;
+let partialEl = null; // current partial message element
+let partialText = '';
 
 const canvasUser  = document.getElementById('wave-user');
 const canvasAgent = document.getElementById('wave-agent');
@@ -100,8 +120,29 @@ export async function startCall(onFinal, onBargeIn) {
   calling = true;
 
   asrWs = connectAsrWs((msg) => {
+    console.log('[voice] ASR msg:', JSON.stringify(msg));
     if (msg.type === 'barge_in') { stopSpeaking(); onBargeIn?.(); }
-    if (msg.type === 'final')    { onFinal(msg.text); }
+    if (msg.type === 'partial') {
+      console.log('[voice] partial:', msg.text);
+      partialText = msg.text;
+      const messagesEl = document.getElementById('messages');
+      if (!partialEl) {
+        partialEl = document.createElement('div');
+        partialEl.className = 'msg msg--user';
+        partialEl.textContent = msg.text;
+        partialEl.setAttribute('data-partial', 'true');
+        messagesEl.appendChild(partialEl);
+      } else {
+        partialEl.textContent = msg.text;
+      }
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+    if (msg.type === 'final') {
+      console.log('[voice] final:', msg.text);
+      if (partialEl) { partialEl.remove(); partialEl = null; }
+      const t = msg.text; partialText = '';
+      onFinal(t);
+    }
   });
 
   const proc = await openMic();
@@ -114,7 +155,7 @@ export async function startCall(onFinal, onBargeIn) {
     const rms = Math.sqrt(f32.reduce((s, v) => s + v * v, 0) / f32.length);
     userLevels[idx++ % 30] = rms;
     drawWave(ctxUser, canvasUser, userLevels, '#4f9cf9');
-    if (rms < vadThreshold) return;
+    // Send ALL audio to ByteDance (including silence) so VAD works properly
     const pcm = new Int16Array(f32.length);
     f32.forEach((v, i) => pcm[i] = Math.max(-32768, Math.min(32767, v * 32768)));
     asrWs.send(pcm.buffer);
@@ -125,6 +166,8 @@ export async function startCall(onFinal, onBargeIn) {
 
 export function stopCall() {
   calling = false;
+  if (partialEl) { partialEl.remove(); partialEl = null; }
+  partialText = '';
   asrWs?.close(); asrWs = null;
   closeMic();
   stopSpeaking();

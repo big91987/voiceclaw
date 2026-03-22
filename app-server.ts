@@ -4,13 +4,17 @@
  */
 
 import { createServer, IncomingMessage, ServerResponse } from 'http';
-import { readFileSync, existsSync } from 'fs';
+import { readFileSync, existsSync, readdirSync, createReadStream, appendFileSync } from 'fs';
 import { join, extname } from 'path';
+import { createInterface } from 'readline';
 import { gzipSync, gunzipSync } from 'zlib';
 import WebSocket, { WebSocketServer } from 'ws';
 import { v4 as uuidv4 } from 'uuid';
 import { loadDeviceIdentity, GatewayClient } from './src/gateway-client';
 import { config } from './src/config';
+
+const LOG_FILE = '/tmp/voiceclaw-asr.log';
+function log(...args: unknown[]) { appendFileSync(LOG_FILE, '[' + new Date().toISOString() + '] ' + args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ') + '\n'); }
 
 const PORT = 3100;
 const APP_DIR = join(__dirname, 'src/app');
@@ -134,6 +138,9 @@ class StreamingAsrSession {
     this.ready = false;
     this.nextSeq = 2;
     this.connectAttempts = 0;
+    this.currentTurnText = '';
+    this.lastProcessedText = '';
+    this.processedUtteranceIds.clear();
     this.openSocket();
   }
 
@@ -153,6 +160,7 @@ class StreamingAsrSession {
     });
 
     this.ws.on('open', () => {
+      log('[ASR server] ByteDance WS open');
       this.connectAttempts = 0;
       this.ws?.send(asrFullClientRequest({
         user: { uid: uuidv4() },
@@ -169,16 +177,19 @@ class StreamingAsrSession {
 
     this.ws.on('message', async (raw) => {
       const msg = parseAsr(Buffer.from(raw as Buffer));
-      if (msg.type === 15) { this.sendEvent({ type: 'error', error: msg.payload }); return; }
+      if (msg.type === 15) { log('[ASR server] type=15 error:', msg.payload); this.sendEvent({ type: 'error', error: msg.payload }); return; }
       if (msg.type !== 9) return;
+      log('[ASR server] type=9 received');
       try {
         const parsed = JSON.parse(msg.payload);
+        log('[ASR server] raw payload:', JSON.stringify(parsed).slice(0, 500));
         const text = parsed?.result?.text || '';
         const utterances: any[] = parsed?.result?.utterances || [];
         const definiteUtterances = utterances.filter((u: any) => u?.definite === true);
         const hasDefinite = definiteUtterances.length > 0;
+        log('[ASR server] text=', JSON.stringify(text), 'utterances=', utterances.length, 'definite=', definiteUtterances.length);
 
-        if (!this.ready) { this.ready = true; this.sendEvent({ type: 'ready' }); }
+        if (!this.ready) { this.ready = true; log('[ASR server] ready'); this.sendEvent({ type: 'ready' }); }
 
         let displayText = text || '';
         if (this.lastProcessedText && displayText) {
@@ -188,9 +199,10 @@ class StreamingAsrSession {
             displayText = disp.slice(norm.length).trim().replace(/^[，。！？,.!?\s]+/, '');
           }
         }
-        if (displayText) this.sendEvent({ type: 'partial', text: displayText, hasDefinite });
+        if (displayText) { log('[ASR server] partial:', displayText); this.sendEvent({ type: 'partial', text: displayText, hasDefinite }); }
 
         if (this.onBargeIn && utterances.length > this.lastUtteranceCount && this.runningReply && !this.bargeInSent) {
+          log('[ASR server] barge_in triggered');
           this.bargeInSent = true;
           this.runningReply = false;
           this.currentTurnText = '';
@@ -211,6 +223,7 @@ class StreamingAsrSession {
             if (turnText) this.currentTurnText += (this.currentTurnText ? ' ' : '') + turnText;
           }
           if (this.currentTurnText) {
+            log('[ASR server] triggering final with definite text:', this.currentTurnText);
             this.runningReply = true;
             const myVersion = ++this.replyVersion;
             const finalText = this.currentTurnText;
@@ -250,7 +263,8 @@ class StreamingAsrSession {
   }
 
   feedPcmChunk(chunk: Buffer) {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.ready || this.closed || !chunk.length) return;
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.ready || this.closed || !chunk.length) { log('[ASR server] feedPcmChunk skipped, wsReady=', this.ws?.readyState, 'ready=', this.ready, 'closed=', this.closed, 'chunkLen=', chunk.length); return; }
+    log('[ASR server] feedPcmChunk', chunk.length, 'bytes');
     for (let off = 0; off < chunk.length; off += 6400) {
       const piece = chunk.subarray(off, off + 6400);
       if (piece.length) this.ws.send(asrAudioOnly(this.nextSeq++, piece));
@@ -443,6 +457,65 @@ const server = createServer(async (req, res) => {
     return;
   }
 
+  // GET /api/openclaw/sessions — scan openclaw session files
+  if (url.startsWith('/api/openclaw/sessions') && req.method === 'GET') {
+    const agentId = new URL(url, 'http://x').searchParams.get('agentId');
+    if (!agentId) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'agentId required' }));
+      return;
+    }
+    const openclawPath = expandPath(new URL(url, 'http://x').searchParams.get('openclawPath') || `${process.env.HOME}/.openclaw`);
+    try {
+      const sessionsDir = join(openclawPath, 'agents', agentId, 'sessions');
+      if (!existsSync(sessionsDir)) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ sessions: [] }));
+        return;
+      }
+      const files = readdirSync(sessionsDir).filter(f => f.endsWith('.jsonl') && !f.includes('.deleted.') && !f.includes('.reset.'));
+      const sessions = await Promise.all(files.map(async (file) => {
+        const sessionId = file.replace('.jsonl', '');
+        const filePath = join(sessionsDir, file);
+        return getSessionInfo(filePath, sessionId);
+      }));
+      sessions.sort((a, b) => b.updatedAt - a.updatedAt);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ sessions }));
+    } catch (e) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: String(e) }));
+    }
+    return;
+  }
+
+  // GET /api/openclaw/history — parse session .jsonl for messages
+  if (url.startsWith('/api/openclaw/history') && req.method === 'GET') {
+    const sessionId = new URL(url, 'http://x').searchParams.get('sessionId');
+    const agentId = new URL(url, 'http://x').searchParams.get('agentId');
+    const openclawPath = expandPath(new URL(url, 'http://x').searchParams.get('openclawPath') || `${process.env.HOME}/.openclaw`);
+    if (!sessionId || !agentId) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'sessionId and agentId required' }));
+      return;
+    }
+    try {
+      const filePath = join(openclawPath, 'agents', agentId, 'sessions', `${sessionId}.jsonl`);
+      if (!existsSync(filePath)) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Session file not found' }));
+        return;
+      }
+      const messages = await parseSessionHistory(filePath);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ messages }));
+    } catch (e) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: String(e) }));
+    }
+    return;
+  }
+
   // GET /api/events — permanent SSE
   if (url === '/api/events') {
     res.writeHead(200, {
@@ -463,7 +536,7 @@ const server = createServer(async (req, res) => {
     req.on('data', chunk => body += chunk);
     req.on('end', async () => {
       try {
-        const { message, agentId, reuseSession, sessionKey } = JSON.parse(body);
+        const { message, agentId, reuseSession, sessionKey, queueMode } = JSON.parse(body);
         if (!message) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: 'Message required' })); return;
@@ -484,18 +557,13 @@ const server = createServer(async (req, res) => {
         let targetRunId: string | undefined;
         let targetSessionKey: string | undefined;
 
-        // 每次请求独立连接（避免持久连接切换 agent 时事件串线）
-        const device = loadDeviceIdentity();
-        if (!device) throw new Error('Device not paired');
-        const chatClient = new GatewayClient(device);
-        await chatClient.connect();
+        // 使用全局预连接的 GatewayClient（复用连接，避免每次新建）
+        const chatClient = await ensureGateway();
 
         let finished = false;
         const finish = () => {
           if (finished) return;
           finished = true;
-          chatClient.offEvent(eventHandler);
-          chatClient.close();
           res.end();
         };
 
@@ -545,6 +613,7 @@ const server = createServer(async (req, res) => {
         const started = await chatClient.sendAgentMessage(message, agentId, {
           reuseSession: !!reuseSession,
           sessionKey: sessionKey || '',
+          queueMode: queueMode || 'interrupt',
         });
         targetRunId = started.runId;
         targetSessionKey = started.sessionKey;
@@ -598,6 +667,7 @@ const wss = new WebSocketServer({ server });
 
 wss.on('connection', (ws, req) => {
   if (req.url !== '/ws/asr') { ws.close(); return; }
+  log('[ASR server] client WS connected');
 
   const send = (data: unknown) => {
     if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(data));
@@ -612,12 +682,86 @@ wss.on('connection', (ws, req) => {
   session.start();
 
   ws.on('message', (data) => {
+    const sz = Buffer.isBuffer(data) ? data.byteLength : (data instanceof ArrayBuffer ? data.byteLength : 0);
+    log('[ASR server] WS msg, size=', sz);
     if (Buffer.isBuffer(data)) session.feedPcmChunk(data);
     else if (data instanceof ArrayBuffer) session.feedPcmChunk(Buffer.from(data));
   });
 
   ws.on('close', () => session.stop());
 });
+
+// ── OpenClaw session file helpers ──────────────────────────
+function expandPath(p: string): string {
+  if (p.startsWith('~/')) return join(process.env.HOME || '', p.slice(2));
+  if (p === '~') return process.env.HOME || '';
+  return p;
+}
+
+interface SessionInfo {
+  sessionId: string;
+  lastMessagePreview: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+async function getSessionInfo(filePath: string, sessionId: string): Promise<SessionInfo> {
+  return new Promise((resolve) => {
+    const rl = createInterface(createReadStream(filePath));
+    let createdAt = 0;
+    let updatedAt = 0;
+    let lastMessagePreview = '';
+
+    rl.on('line', (line) => {
+      try {
+        const obj = JSON.parse(line);
+        const ts = obj.timestamp ? new Date(obj.timestamp).getTime() : (obj.message?.timestamp || 0);
+
+        // First line with type=session gives us createdAt
+        if (obj.type === 'session' && !createdAt) {
+          createdAt = ts;
+        }
+
+        // Track latest timestamp for updatedAt
+        if (ts > updatedAt) updatedAt = ts;
+
+        // Scan from bottom for last message preview
+        if (obj.type === 'message' && obj.message?.content && !lastMessagePreview) {
+          const content = obj.message.content;
+          if (Array.isArray(content)) {
+            const text = content.find((c: any) => c.type === 'text')?.text || '';
+            lastMessagePreview = text.slice(0, 60);
+          } else if (typeof content === 'string') {
+            lastMessagePreview = content.slice(0, 60);
+          }
+        }
+      } catch {}
+    });
+    rl.on('close', () => resolve({ sessionId, lastMessagePreview, createdAt, updatedAt }));
+    rl.on('error', () => resolve({ sessionId, lastMessagePreview: '', createdAt: 0, updatedAt: 0 }));
+  });
+}
+
+async function parseSessionHistory(filePath: string): Promise<any[]> {
+  return new Promise((resolve, reject) => {
+    const messages: any[] = [];
+    const rl = createInterface(createReadStream(filePath));
+    rl.on('line', (line) => {
+      try {
+        const obj = JSON.parse(line);
+        if (obj.type === 'message' && obj.message) {
+          messages.push({
+            role: obj.message.role,
+            content: obj.message.content,
+            timestamp: obj.message.timestamp,
+          });
+        }
+      } catch {}
+    });
+    rl.on('close', () => resolve(messages));
+    rl.on('error', reject);
+  });
+}
 
 server.listen(PORT, () => {
   console.log(`App server running at http://localhost:${PORT}`);

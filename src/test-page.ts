@@ -352,18 +352,8 @@ async function streamChatViaTestServer(
     }
 
     if (parsed?.event === 'chat' && payload?.message?.role === 'assistant') {
-      const content = payload?.message?.content;
-      if (typeof content === 'string') return content;
-      if (Array.isArray(content)) {
-        return content
-          .map((item: any) => {
-            if (typeof item === 'string') return item;
-            if (item?.type === 'text' && typeof item?.text === 'string') return item.text;
-            return '';
-          })
-          .join('');
-      }
-      if (typeof payload?.message?.text === 'string') return payload.message.text;
+      // chat event 只用于结束检测，不重复提取文本
+      return '';
     }
 
     return '';
@@ -1492,12 +1482,13 @@ function updateParaDashboard(additions) {
   document.getElementById('volumeEl').textContent = volume ? volume.toFixed(1) : '—';
 }
 
-function addHistory(text, additions) {
+function addHistory(text, additions, role) {
   const entry = document.createElement('div');
   entry.className = 'hist-entry';
+  if (role === 'assistant') entry.style.cssText = 'border-left: 3px solid #4a9eff; padding-left: 8px; opacity: 0.85';
   const textDiv = document.createElement('div');
   textDiv.className = 'hist-text';
-  textDiv.textContent = text;
+  textDiv.textContent = (role === 'assistant' ? '🤖 ' : '👤 ') + text;
   entry.appendChild(textDiv);
   if (additions) {
     const badges = document.createElement('div');
@@ -1707,7 +1698,7 @@ async function connectAndTalk(){
       setState('thinking');
     }
     if (msg.type === 'para_features') updateParaDashboard(msg.additions);
-    if (msg.type === 'history_entry') addHistory(msg.text, msg.additions);
+    if (msg.type === 'history_entry') addHistory(msg.text, msg.additions, msg.role);
     if (msg.type === 'reply_text') replyEl.textContent += msg.text || '';
     if (msg.type === 'audio_chunk' && msg.audioChunk) { enqueueChunk(msg.audioChunk); setState('speaking'); }
     if (msg.type === 'reply_done') {
@@ -1902,7 +1893,7 @@ wssParaClaw.on('connection', (client, req) => {
                 pendingTts.push(ttsPromise);
               };
 
-              await streamChatViaTestServer(
+              const fullReply = await streamChatViaTestServer(
                 agentText,
                 { proxyBase: gw.proxyBase, agentId: gw.agentId, sessionKey: gw.sessionKey, queueMode: gw.queueMode },
                 handleToken,
@@ -1922,6 +1913,7 @@ wssParaClaw.on('connection', (client, req) => {
               await Promise.all(pendingTts);
               if (stopped || myGeneration !== generation) return;
               const replyDoneAt = Date.now();
+              if (fullReply) send({ type: 'history_entry', text: fullReply, role: 'assistant' });
               send({
                 type: 'reply_done',
                 turnId,

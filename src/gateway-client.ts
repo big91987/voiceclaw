@@ -9,7 +9,6 @@ import { v4 as uuidv4 } from 'uuid';
 import crypto from 'crypto';
 
 export const GATEWAY_URL = process.env.OPENCLAW_GATEWAY_URL || 'ws://127.0.0.1:18789';
-export const GATEWAY_TOKEN = process.env.OPENCLAW_GATEWAY_TOKEN || '53f48388b0c74d7eb8aded3b643afd6b';
 
 // ED25519 SPKI prefix
 const ED25519_SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
@@ -18,19 +17,41 @@ export interface DeviceIdentity {
   deviceId: string;
   publicKeyPem: string;
   privateKeyPem: string;
+  gatewayToken: string;
 }
 
-// 从文件加载 device identity
+function loadGatewayToken(deviceId: string): string {
+  // 1. 环境变量优先
+  const envToken = process.env.OPENCLAW_GATEWAY_TOKEN;
+  if (envToken) return envToken;
+
+  // 2. 从 paired.json 读
+  try {
+    const pairedPath = `${process.env.HOME}/.openclaw/devices/paired.json`;
+    const pairedRaw = readFileSync(pairedPath, 'utf8');
+    const paired = JSON.parse(pairedRaw);
+    const entry = paired[deviceId];
+    const token = entry?.tokens?.operator?.token;
+    if (token) return token;
+  } catch {
+    // ignore
+  }
+
+  return '';
+}
+
+// 从 openclaw 标准路径加载 device identity
 export function loadDeviceIdentity(): DeviceIdentity | null {
   try {
-    const path = `${process.env.HOME}/.openclaw/voiceclaw-device.json`;
+    const path = `${process.env.HOME}/.openclaw/identity/device.json`;
     const raw = readFileSync(path, 'utf8');
     const parsed = JSON.parse(raw);
-    if (parsed?.version === 1 && parsed.deviceId && parsed.publicKeyPem && parsed.privateKeyPem) {
+    if (parsed?.deviceId && parsed?.publicKeyPem && parsed?.privateKeyPem) {
       return {
         deviceId: parsed.deviceId,
         publicKeyPem: parsed.publicKeyPem,
         privateKeyPem: parsed.privateKeyPem,
+        gatewayToken: loadGatewayToken(parsed.deviceId),
       };
     }
   } catch {
@@ -59,10 +80,11 @@ export function buildDeviceAuthPayload(params: {
   signedAtMs: number;
   nonce: string;
   token?: string;
+  platform?: string;
 }): string {
   const scopes = params.scopes.join(',');
   const token = params.token ?? '';
-  const platform = 'node';
+  const platform = params.platform ?? 'darwin';
   const deviceFamily = '';
   return [
     'v3', params.deviceId, params.clientId, params.clientMode,
@@ -162,7 +184,8 @@ export class GatewayClient {
     const payload = buildDeviceAuthPayload({
       deviceId: this.device.deviceId,
       clientId, clientMode, role, scopes,
-      signedAtMs, nonce: this.connectNonce, token: GATEWAY_TOKEN,
+      signedAtMs, nonce: this.connectNonce, token: this.device.gatewayToken,
+      platform: 'darwin',
     });
     const signature = signData(payload, this.device.privateKeyPem);
 
@@ -170,8 +193,8 @@ export class GatewayClient {
       type: 'req', id, method: 'connect',
       params: {
         minProtocol: 3, maxProtocol: 3,
-        client: { id: clientId, version: '1.0.0', platform: 'node', mode: clientMode },
-        auth: { token: GATEWAY_TOKEN },
+        client: { id: clientId, version: '1.0.0', platform: 'darwin', mode: clientMode },
+        auth: { token: this.device.gatewayToken },
         role, scopes, caps: [],
         device: {
           id: this.device.deviceId,
@@ -210,7 +233,7 @@ export class GatewayClient {
   async sendAgentMessage(
     message: string,
     agentId: string,
-    opts?: { reuseSession?: boolean; sessionKey?: string },
+    opts?: { reuseSession?: boolean; sessionKey?: string; queueMode?: string },
   ): Promise<{ frame: any; sessionKey: string; runId?: string }> {
     if (!this.ws) throw new Error('Not connected');
 

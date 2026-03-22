@@ -1,16 +1,49 @@
 // src/app/main.js — entry point: wires all modules together
-import { connectEvents, on, streamChat, emitSessionChange } from './api.js';
+import { connectEvents, on, streamChat, emitSessionChange, getOpenClawPath } from './api.js';
 import { initAgentSelector, getAgentId } from './ui-agents.js';
 import { initChat, sendMessage, getCurrentSessionKey, appendMessage } from './ui-chat.js';
 import { initTasks } from './ui-tasks.js';
-import { initSessionSelector, getSessionKey, clearSessionKey, refreshSessions } from './ui-sessions.js';
+import { initSessionSelector, getSessionKey, getResolvedSessionKey, getSessionKeyForId, clearSessionKey, refreshSessions } from './ui-sessions.js';
 import { startDictation, stopDictation, speak, stopSpeaking, startCall, stopCall } from './voice.js';
+import { initSettingsTab } from './ui-settings.js';
 
 // ── Status dot ─────────────────────────────────────────────
 const dot = document.getElementById('status-dot');
 connectEvents();
 on('gateway-event', (e) => {
   if (e.type === 'connected') dot.className = 'dot dot--on';
+});
+
+// ── Tab switching ──────────────────────────────────────────
+let currentTab = 'chat';
+
+function switchTab(tab) {
+  currentTab = tab;
+  const chatArea = document.getElementById('chat-area');
+  const settingsPanel = document.getElementById('settings-panel');
+  const tabChat = document.getElementById('tab-chat');
+  const tabSettings = document.getElementById('tab-settings');
+
+  if (tab === 'chat') {
+    chatArea.classList.remove('hidden');
+    settingsPanel.classList.add('hidden');
+    tabChat.classList.add('tab-btn--active');
+    tabSettings.classList.remove('tab-btn--active');
+  } else {
+    chatArea.classList.add('hidden');
+    settingsPanel.classList.remove('hidden');
+    tabChat.classList.remove('tab-btn--active');
+    tabSettings.classList.add('tab-btn--active');
+  }
+}
+
+document.getElementById('tab-chat').addEventListener('click', () => switchTab('chat'));
+document.getElementById('tab-settings').addEventListener('click', () => switchTab('settings'));
+
+// ── Settings Tab ─────────────────────────────────────────
+initSettingsTab((newPath) => {
+  const agentId = getAgentId();
+  if (agentId) refreshSessions(agentId);
 });
 
 // ── Agent selector ─────────────────────────────────────────
@@ -42,11 +75,15 @@ async function handleSend() {
   if (!text) return;
   textInput.value = '';
   textInput.style.height = '';
+  // Historical sessions: use the resolved gateway session key
+  // (resolveSessionKey is awaited in the dropdown change handler, so it should be ready)
+  const selectedId = getSessionKey();
+  const sessionKey = selectedId ? getResolvedSessionKey() : getCurrentSessionKey();
   await sendMessage({
     text,
     agentId: getAgentId(),
     reuseSession: true,
-    sessionKey: getSessionKey() ?? getCurrentSessionKey(),
+    sessionKey,
   });
 }
 
