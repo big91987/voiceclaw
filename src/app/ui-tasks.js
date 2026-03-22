@@ -11,6 +11,10 @@ let currentAgentId = null;
 let currentSessionKey = null;
 let sidebarOpen = false;
 
+// tool call bubble state: toolCallId → { wrap, dot, status, detail, cachedArgs }
+const toolCallMap = new Map();
+const messagesEl = document.getElementById('messages');
+
 // Listen to session changes from ui-sessions
 on('session-change', (sessionKey) => {
   setCurrentSession(sessionKey);
@@ -138,3 +142,85 @@ function render() {
 
   roots.forEach(r => renderTree(r, 0));
 }
+
+function createToolBubble(toolCallId, name) {
+  const wrap = document.createElement('div');
+  wrap.className = 'msg msg--tool';
+  wrap.dataset.toolCallId = toolCallId;
+
+  const summary = document.createElement('div');
+  summary.className = 'tool-summary';
+
+  const dot = document.createElement('div');
+  dot.className = 'tool-dot running';
+
+  const nameEl = document.createElement('span');
+  nameEl.className = 'tool-name';
+  nameEl.textContent = name;
+
+  const status = document.createElement('span');
+  status.className = 'tool-status';
+  status.textContent = '运行中…';
+
+  summary.append(dot, nameEl, status);
+
+  const detail = document.createElement('div');
+  detail.className = 'tool-detail';
+  detail.hidden = true;
+
+  summary.addEventListener('click', () => {
+    detail.hidden = !detail.hidden;
+  });
+
+  wrap.append(summary, detail);
+  return { wrap, dot, status, detail };
+}
+
+// Second on('agent-event') handler for tool stream — safe to register alongside the lifecycle handler above
+on('agent-event', (event) => {
+  const payload = event.payload || {};
+  if (payload.stream !== 'tool') return;
+
+  const data = payload.data || {};
+  const { toolCallId, name, phase, args, result } = data;
+  if (!toolCallId) return;
+
+  if (phase === 'start') {
+    const els = createToolBubble(toolCallId, name);
+    // cache args from start event — result event may not carry them
+    toolCallMap.set(toolCallId, { ...els, cachedArgs: args });
+    if (messagesEl) {
+      messagesEl.appendChild(els.wrap);
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+  } else if (phase === 'result') {
+    const els = toolCallMap.get(toolCallId);
+    if (!els) return;
+
+    // update status indicator
+    els.dot.className = 'tool-dot done';
+    els.status.textContent = '完成 · 点击展开';
+
+    // fill detail (use args cached from start event)
+    const argsText = els.cachedArgs !== undefined
+      ? 'args: ' + JSON.stringify(els.cachedArgs, null, 2)
+      : '';
+    const resultText = result !== undefined
+      ? '\nresult: ' + (typeof result === 'string' ? result : JSON.stringify(result, null, 2))
+      : '';
+
+    const argsDiv = document.createElement('div');
+    argsDiv.className = 'tool-detail-args';
+    argsDiv.textContent = argsText;
+
+    const resultDiv = document.createElement('div');
+    resultDiv.className = 'tool-detail-result';
+    resultDiv.textContent = resultText;
+
+    els.detail.append(argsDiv, resultDiv);
+    if (messagesEl) messagesEl.scrollTop = messagesEl.scrollHeight;
+
+    // release map entry to avoid unbounded growth
+    toolCallMap.delete(toolCallId);
+  }
+});

@@ -130,3 +130,47 @@ canvas { border-radius: 4px; background: var(--bg3); }
 }
 .settings-row input:focus { outline: none; border-color: var(--accent); }
 .settings-hint { margin-top: 6px; font-size: 0.8em; color: var(--text2); }
+
+/* Tool call bubbles */
+.msg--tool {
+  align-self: flex-start;
+  background: #242424;
+  border: 1px solid #3a3a3a;
+  border-radius: 8px;
+  max-width: 80%;
+  overflow: hidden;
+  font-size: 13px;
+  cursor: default;
+}
+.tool-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 12px;
+  color: #bbb;
+  cursor: pointer;
+  user-select: none;
+}
+.tool-summary:hover { background: #2a2a2a; }
+.tool-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.tool-dot.running { background: #f9c74f; }
+.tool-dot.done    { background: #52c878; }
+.tool-name   { color: #c8a0ff; font-weight: 500; }
+.tool-status { color: #666; font-size: 11px; }
+.tool-detail {
+  border-top: 1px solid #333;
+  padding: 8px 12px;
+  background: #1a1a1a;
+  color: #888;
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.tool-detail-args   { color: #888; }
+.tool-detail-result { color: #52c878; margin-top: 4px; }
