@@ -54,11 +54,14 @@
     </div>
     <!-- Call mode (hidden by default) -->
     <div id="input-call" class="hidden">
-      <div class="wave-container">
-        <canvas id="wave-user" width="200" height="60"></canvas>
-        <span class="wave-label">你</span>
-        <span class="wave-label">Agent</span>
-        <canvas id="wave-agent" width="200" height="60"></canvas>
+      <div id="call-init-hint" class="call-init-hint">⏳ 正在初始化麦克风…</div>
+      <div id="call-ready-area" class="hidden">
+        <div class="wave-container">
+          <canvas id="wave-user" width="200" height="60"></canvas>
+          <span class="wave-label">你</span>
+          <span class="wave-label">Agent</span>
+          <canvas id="wave-agent" width="200" height="60"></canvas>
+        </div>
       </div>
       <button id="btn-hangup" class="btn-danger">🔴 挂断</button>
     </div>

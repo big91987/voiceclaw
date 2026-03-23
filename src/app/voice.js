@@ -115,12 +115,13 @@ const canvasAgent = document.getElementById('wave-agent');
 const ctxUser  = canvasUser?.getContext('2d');
 const ctxAgent = canvasAgent?.getContext('2d');
 
-export async function startCall(onFinal, onBargeIn) {
+export async function startCall(onFinal, onBargeIn, onReady) {
   if (calling) return;
   calling = true;
 
   asrWs = connectAsrWs((msg) => {
     console.log('[voice] ASR msg:', JSON.stringify(msg));
+    if (msg.type === 'ready') { onReady?.(); }
     if (msg.type === 'barge_in') { stopSpeaking(); onBargeIn?.(); }
     if (msg.type === 'partial') {
       console.log('[voice] partial:', msg.text);

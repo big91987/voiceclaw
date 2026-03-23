@@ -101,6 +101,16 @@ body {
 .wave-label { font-size: 0.8em; color: var(--text2); }
 canvas { border-radius: 4px; background: var(--bg3); }
 
+.call-init-hint {
+  font-size: 13px;
+  color: var(--text2);
+  animation: pulse 1.2s ease-in-out infinite;
+}
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.4; }
+}
+
 .hidden { display: none !important; }
 
 /* Tab bar */

@@ -127,7 +127,19 @@ const btnCall    = document.getElementById('btn-call');
 const btnHangup  = document.getElementById('btn-hangup');
 const inputNormal = document.getElementById('input-normal');
 const inputCall   = document.getElementById('input-call');
+const callInitHint = document.getElementById('call-init-hint');
+const callReadyArea = document.getElementById('call-ready-area');
 let inCall = false;
+
+function showCallReady() {
+  callInitHint.classList.add('hidden');
+  callReadyArea.classList.remove('hidden');
+}
+
+function resetCallUI() {
+  callInitHint.classList.remove('hidden');
+  callReadyArea.classList.add('hidden');
+}
 
 btnCall.addEventListener('click', async () => {
   if (inCall) return;
@@ -135,6 +147,7 @@ btnCall.addEventListener('click', async () => {
   inputNormal.classList.add('hidden');
   inputCall.classList.remove('hidden');
   btnCall.classList.add('active');
+  resetCallUI(); // show "初始化中…" every time call starts
 
   let currentAc = null;
   let currentRunId = null;
@@ -147,16 +160,62 @@ btnCall.addEventListener('click', async () => {
       // Voice final → send to agent, stream reply, speak it
       const myGeneration = ++generation;
       appendMessage('user', text);
-      let reply = '';
-      const thinking = appendMessage('assistant', '...');
+
+      const agentId = getAgentId();
+      if (!agentId) {
+        const err = appendMessage('assistant', '[错误] 未选择 Agent');
+        err.style.color = 'var(--danger)';
+        return;
+      }
+
+      // TTS queue: speak segments in order without blocking stream consumption
+      const ttsQueue = [];
+      let ttsBusy = false;
+      async function flushTts() {
+        if (ttsBusy) return;
+        while (ttsQueue.length > 0) {
+          if (myGeneration !== generation) { ttsQueue.length = 0; return; }
+          ttsBusy = true;
+          const seg = ttsQueue.shift();
+          await speak(seg).catch(() => {});
+          ttsBusy = false;
+        }
+      }
+      function enqueueTts(seg) {
+        if (!seg) return;
+        ttsQueue.push(seg);
+        flushTts();
+      }
+
+      // Current text bubble state
+      let thinking = appendMessage('assistant', '...');
       thinking.classList.add('msg--thinking');
+      thinking.dataset.currentTurn = '1';
+      let reply = '';
+
+      // Commit current bubble: freeze it, TTS the text, return a fresh thinking bubble
+      function commitSegment() {
+        if (reply) {
+          thinking.className = 'msg msg--assistant';
+          delete thinking.dataset.currentTurn;
+          enqueueTts(reply);
+        } else if (thinking.parentNode) {
+          thinking.remove();
+        }
+        // New thinking bubble for next text segment
+        thinking = appendMessage('assistant', '...');
+        thinking.classList.add('msg--thinking');
+        thinking.dataset.currentTurn = '1';
+        reply = '';
+      }
+
       const ac = new AbortController();
       currentAc = ac;
 
       try {
         for await (const ev of streamChat({
           message: text,
-          agentId: getAgentId(),
+          agentId,
           sessionKey: callSessionKey,
           reuseSession: true,
           queueMode: 'interrupt',
@@ -168,8 +227,13 @@ btnCall.addEventListener('click', async () => {
           if (ev.type === 'metric' && ev.metric === 'session_start') {
             currentRunId = ev.runId;
             currentSessionKey = ev.sessionKey;
-            if (!callSessionKey) callSessionKey = ev.sessionKey; // sticky for subsequent turns
+            if (!callSessionKey) callSessionKey = ev.sessionKey;
           }
+          // Tool start → commit current text segment, start fresh after tool
+          if (ev.event === 'agent' && ev.payload?.stream === 'tool' && ev.payload?.data?.phase === 'start') {
+            commitSegment();
+          }
+          // Assistant delta
           if (ev.event === 'agent' && ev.payload?.stream === 'assistant') {
             const d = ev.payload?.data?.delta;
             if (d) {
@@ -184,7 +248,14 @@ btnCall.addEventListener('click', async () => {
           }
         }
       } catch (err) {
-        if (err.name !== 'AbortError') console.error('[call] streamChat error:', err);
+        if (err.name !== 'AbortError') {
+          console.error('[call] streamChat error:', err);
+          thinking.className = 'msg msg--assistant';
+          thinking.textContent = `[错误] ${err.message}`;
+          thinking.style.color = 'var(--danger)';
+          delete thinking.dataset.currentTurn;
+          return;
+        }
       }
 
       currentAc = null;
@@ -193,14 +264,21 @@ btnCall.addEventListener('click', async () => {
       // Stale check: barge-in happened during this turn
       if (myGeneration !== generation) {
         if (thinking.parentNode) {
-          thinking.classList.remove('msg--thinking');
           thinking.className = 'msg msg--assistant';
           thinking.textContent = (reply || '...') + '（被打断）';
+          delete thinking.dataset.currentTurn;
         }
         return;
       }
-      if (!reply && thinking.parentNode) thinking.remove();
-      if (reply) await speak(reply);
+
+      // Commit final segment
+      delete thinking.dataset.currentTurn;
+      if (reply) {
+        thinking.className = 'msg msg--assistant';
+        enqueueTts(reply);
+      } else if (thinking.parentNode) {
+        thinking.remove();
+      }
     },
     async () => {
       // barge-in: bump generation, abort gateway run + SSE stream + TTS
@@ -217,6 +295,10 @@ btnCall.addEventListener('click', async () => {
       }
       currentAc?.abort();
     },
+    () => {
+      // onReady: ASR initialized, show waveform
+      showCallReady();
+    },
   );
 });
 
@@ -227,4 +309,5 @@ btnHangup.addEventListener('click', () => {
   inputCall.classList.add('hidden');
   inputNormal.classList.remove('hidden');
   btnCall.classList.remove('active');
+  resetCallUI();
 });
