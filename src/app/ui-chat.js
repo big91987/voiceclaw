@@ -1,6 +1,7 @@
 // src/app/ui-chat.js — conversation messages + streaming assistant replies
 import { streamChat, fetchChatHistory, getOpenClawPath, on } from './api.js';
-import { appendStaticToolBubble, createThinkingBubble } from './ui-tasks.js';
+import { appendStaticToolBubble, createThinkingBubble, appendStaticThinkingBubble } from './ui-tasks.js';
+import { getSetting } from './settings.js';
 
 const messagesEl = document.getElementById('messages');
 let currentSessionKey = null;
@@ -49,8 +50,10 @@ async function loadHistory(agentId, sessionId) {
           } else if (block.type === 'toolCall') {
             const result = toolResults.get(block.id);
             appendStaticToolBubble(block.name, block.arguments, result);
+          } else if (block.type === 'thinking') {
+            const text = block.thinking || block.text;
+            if (text && getSetting('showThinking')) appendStaticThinkingBubble(text);
           }
-          // skip 'thinking' blocks
         }
       } else if (typeof content === 'string' && content) {
         appendMessage(msg.role, content);
@@ -96,6 +99,11 @@ export async function sendMessage({ text, agentId, reuseSession, sessionKey, que
     return thinkingBubble;
   }
 
+  function finalizeThinkingBubble(tb) {
+    tb.dot.className = 'tool-dot done';
+    tb.nameEl.textContent = '已思考';
+  }
+
   try {
     for await (const event of streamChat({ message: text, agentId, sessionKey, reuseSession, queueMode })) {
       if (event.done) break;
@@ -108,8 +116,10 @@ export async function sendMessage({ text, agentId, reuseSession, sessionKey, que
 
       // Reasoning/thinking stream
       if (event.event === 'agent' && event.payload?.stream === 'thinking') {
+        if (!getSetting('showThinking')) continue;
         const raw = event.payload?.data?.text;
         if (typeof raw === 'string' && raw) {
+          if (thinkingBubble) { finalizeThinkingBubble(thinkingBubble); thinkingBubble = null; }
           const tb = getOrCreateThinkingBubble();
           // Strip "Reasoning:\n" prefix and "_..._" markdown italics
           const stripped = raw
@@ -123,11 +133,7 @@ export async function sendMessage({ text, agentId, reuseSession, sessionKey, que
       // Tool call start — finalize current thinking bubble so each phase gets its own
       if (event.event === 'agent' && event.payload?.stream === 'tool' &&
           event.payload?.data?.phase === 'start') {
-        if (thinkingBubble) {
-          thinkingBubble.dot.className = 'tool-dot done';
-          thinkingBubble.nameEl.textContent = '已思考';
-          thinkingBubble = null;
-        }
+        if (thinkingBubble) { finalizeThinkingBubble(thinkingBubble); thinkingBubble = null; }
       }
 
       // Stream assistant text
@@ -135,11 +141,7 @@ export async function sendMessage({ text, agentId, reuseSession, sessionKey, que
         const delta = event.payload?.data?.delta;
         if (typeof delta === 'string' && delta) {
           // Finalize thinking bubble once assistant text starts
-          if (thinkingBubble) {
-            thinkingBubble.dot.className = 'tool-dot done';
-            thinkingBubble.nameEl.textContent = '已思考';
-            thinkingBubble = null;
-          }
+          if (thinkingBubble) { finalizeThinkingBubble(thinkingBubble); thinkingBubble = null; }
           if (thinking.classList.contains('msg--thinking')) {
             thinking.className = 'msg msg--assistant';
             thinking.textContent = '';
@@ -160,9 +162,6 @@ export async function sendMessage({ text, agentId, reuseSession, sessionKey, que
     thinking.remove();
   }
   // Finalize thinking bubble if it wasn't closed by assistant text
-  if (thinkingBubble) {
-    thinkingBubble.dot.className = 'tool-dot done';
-    thinkingBubble.nameEl.textContent = '已思考';
-  }
+  if (thinkingBubble) { finalizeThinkingBubble(thinkingBubble); }
   delete thinking.dataset.currentTurn;
 }
