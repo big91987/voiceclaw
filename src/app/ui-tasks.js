@@ -1,5 +1,6 @@
 // src/app/ui-tasks.js — task board sidebar with real-time session tree
 import { fetchSessions, on } from './api.js';
+import { getSetting } from './settings.js';
 
 const panel = document.getElementById('tasks-panel');
 const toggleBtn = document.getElementById('tasks-toggle');
@@ -205,6 +206,7 @@ export function createThinkingBubble() {
 
 // Static tool bubble for history replay
 export function appendStaticToolBubble(name, args, result) {
+  if (!getSetting('showToolCalls')) return;
   const { wrap, dot, status, detail } = createToolBubble('history-' + name + '-' + Date.now(), name);
   dot.className = 'tool-dot done';
   status.textContent = '完成 · 点击展开';
@@ -218,6 +220,15 @@ export function appendStaticToolBubble(name, args, result) {
   if (messagesEl) messagesEl.appendChild(wrap);
 }
 
+// Static thinking bubble for history replay — done-state, collapsed
+export function appendStaticThinkingBubble(text) {
+  const { wrap, dot, nameEl, content } = createThinkingBubble();
+  dot.className = 'tool-dot done';
+  nameEl.textContent = '已思考';
+  content.textContent = text;
+  if (messagesEl) messagesEl.appendChild(wrap);
+}
+
 // Second on('agent-event') handler for tool stream — safe to register alongside the lifecycle handler above
 on('agent-event', (event) => {
   const payload = event.payload || {};
@@ -227,6 +238,7 @@ on('agent-event', (event) => {
   if (!toolCallId) return;
 
   if (phase === 'start') {
+    if (!getSetting('showToolCalls')) return;
     const els = createToolBubble(toolCallId, name);
     // cache args from start event — result event may not carry them
     toolCallMap.set(toolCallId, { ...els, cachedArgs: args });
