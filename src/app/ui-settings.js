@@ -1,5 +1,6 @@
 // src/app/ui-settings.js — Settings Tab UI
 import { getOpenClawPath, setOpenClawPath } from './api.js';
+import { getSetting, setSetting } from './settings.js';
 
 let onPathChangeCallback = null;
 
@@ -12,6 +13,21 @@ export function initSettingsTab(onPathChange) {
     setOpenClawPath(path);
     onPathChangeCallback?.(path);
   });
+
+  // Initialize and wire showThinking toggle
+  const showThinkingEl = document.getElementById('setting-show-thinking');
+  showThinkingEl.checked = getSetting('showThinking');
+  showThinkingEl.addEventListener('change', () => setSetting('showThinking', showThinkingEl.checked));
+
+  // Initialize and wire showToolCalls toggle
+  const showToolCallsEl = document.getElementById('setting-show-tool-calls');
+  showToolCallsEl.checked = getSetting('showToolCalls');
+  showToolCallsEl.addEventListener('change', () => setSetting('showToolCalls', showToolCallsEl.checked));
+
+  // Initialize and wire callQueueMode select
+  const callQueueModeEl = document.getElementById('setting-call-queue-mode');
+  callQueueModeEl.value = getSetting('callQueueMode');
+  callQueueModeEl.addEventListener('change', () => setSetting('callQueueMode', callQueueModeEl.value));
 }
 
 export function getCurrentPath() {
