@@ -2,7 +2,7 @@
 import { connectEvents, on, streamChat, emitSessionChange, getOpenClawPath } from './api.js';
 import { initAgentSelector, getAgentId } from './ui-agents.js';
 import { initChat, sendMessage, getCurrentSessionKey, appendMessage } from './ui-chat.js';
-import { initTasks } from './ui-tasks.js';
+import { initTasks, createThinkingBubble } from './ui-tasks.js';
 import { initSessionSelector, getSessionKey, getResolvedSessionKey, getSessionKeyForId, clearSessionKey, refreshSessions } from './ui-sessions.js';
 import { startDictation, stopDictation, speak, stopSpeaking, startCall, stopCall } from './voice.js';
 import { initSettingsTab } from './ui-settings.js';
@@ -193,6 +193,14 @@ btnCall.addEventListener('click', async () => {
       thinking.classList.add('msg--thinking');
       thinking.dataset.currentTurn = '1';
       let reply = '';
+      let callThinkingBubble = null;
+
+      function finalizeCallThinkingBubble() {
+        if (!callThinkingBubble) return;
+        callThinkingBubble.dot.className = 'tool-dot done';
+        callThinkingBubble.nameEl.textContent = '已思考';
+        callThinkingBubble = null;
+      }
 
       // Commit current bubble: freeze it, TTS the text, return a fresh thinking bubble
       function commitSegment() {
@@ -230,14 +238,32 @@ btnCall.addEventListener('click', async () => {
             currentSessionKey = ev.sessionKey;
             if (!callSessionKey) callSessionKey = ev.sessionKey;
           }
-          // Tool start → commit current text segment, start fresh after tool
+          // Thinking stream
+          if (ev.event === 'agent' && ev.payload?.stream === 'thinking') {
+            if (getSetting('showThinking')) {
+              const raw = ev.payload?.data?.text;
+              if (typeof raw === 'string' && raw) {
+                if (!callThinkingBubble) {
+                  callThinkingBubble = createThinkingBubble();
+                  const turnEl = document.getElementById('messages').querySelector('[data-current-turn]');
+                  if (turnEl) document.getElementById('messages').insertBefore(callThinkingBubble.wrap, turnEl);
+                  else document.getElementById('messages').appendChild(callThinkingBubble.wrap);
+                }
+                const stripped = raw.replace(/^Reasoning:\n/i, '').replace(/^_|_$/gm, '');
+                callThinkingBubble.content.textContent = stripped;
+              }
+            }
+          }
+          // Tool start → finalize thinking bubble, commit current text segment
           if (ev.event === 'agent' && ev.payload?.stream === 'tool' && ev.payload?.data?.phase === 'start') {
+            finalizeCallThinkingBubble();
             commitSegment();
           }
           // Assistant delta
           if (ev.event === 'agent' && ev.payload?.stream === 'assistant') {
             const d = ev.payload?.data?.delta;
             if (d) {
+              finalizeCallThinkingBubble();
               if (thinking.classList.contains('msg--thinking')) {
                 thinking.className = 'msg msg--assistant';
                 thinking.textContent = '';
@@ -261,6 +287,7 @@ btnCall.addEventListener('click', async () => {
 
       currentAc = null;
       currentRunId = null;
+      finalizeCallThinkingBubble();
 
       // Stale check: barge-in happened during this turn
       if (myGeneration !== generation) {
