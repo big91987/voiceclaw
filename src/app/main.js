@@ -6,6 +6,7 @@ import { initTasks } from './ui-tasks.js';
 import { initSessionSelector, getSessionKey, getResolvedSessionKey, getSessionKeyForId, clearSessionKey, refreshSessions } from './ui-sessions.js';
 import { startDictation, stopDictation, speak, stopSpeaking, startCall, stopCall } from './voice.js';
 import { initSettingsTab } from './ui-settings.js';
+import { getSetting } from './settings.js';
 
 // ── Status dot ─────────────────────────────────────────────
 const dot = document.getElementById('status-dot');
@@ -218,7 +219,7 @@ btnCall.addEventListener('click', async () => {
           agentId,
           sessionKey: callSessionKey,
           reuseSession: true,
-          queueMode: 'interrupt',
+          queueMode: getSetting('callQueueMode'),
           signal: ac.signal,
         })) {
           if (myGeneration !== generation) break; // barged-in, discard
