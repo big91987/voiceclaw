@@ -188,10 +188,8 @@ btnCall.addEventListener('click', async () => {
         flushTts();
       }
 
-      // Current text bubble state
-      let thinking = appendMessage('assistant', '...');
-      thinking.classList.add('msg--thinking');
-      thinking.dataset.currentTurn = '1';
+      // Lazy reply element — created only when first assistant delta arrives
+      let replyEl = null;
       let reply = '';
       let callThinkingBubble = null;
 
@@ -200,22 +198,6 @@ btnCall.addEventListener('click', async () => {
         callThinkingBubble.dot.className = 'tool-dot done';
         callThinkingBubble.nameEl.textContent = '已思考';
         callThinkingBubble = null;
-      }
-
-      // Commit current bubble: freeze it, TTS the text, return a fresh thinking bubble
-      function commitSegment() {
-        if (reply) {
-          thinking.className = 'msg msg--assistant';
-          delete thinking.dataset.currentTurn;
-          enqueueTts(reply);
-        } else if (thinking.parentNode) {
-          thinking.remove();
-        }
-        // New thinking bubble for next text segment
-        thinking = appendMessage('assistant', '...');
-        thinking.classList.add('msg--thinking');
-        thinking.dataset.currentTurn = '1';
-        reply = '';
       }
 
       const ac = new AbortController();
@@ -245,31 +227,32 @@ btnCall.addEventListener('click', async () => {
               if (typeof raw === 'string' && raw) {
                 if (!callThinkingBubble) {
                   callThinkingBubble = createThinkingBubble();
-                  const turnEl = document.getElementById('messages').querySelector('[data-current-turn]');
-                  if (turnEl) document.getElementById('messages').insertBefore(callThinkingBubble.wrap, turnEl);
-                  else document.getElementById('messages').appendChild(callThinkingBubble.wrap);
+                  document.getElementById('messages').appendChild(callThinkingBubble.wrap);
                 }
                 const stripped = raw.replace(/^Reasoning:\n/i, '').replace(/^_|_$/gm, '');
                 callThinkingBubble.content.textContent = stripped;
               }
             }
           }
-          // Tool start → finalize thinking bubble, commit current text segment
+          // Tool start → finalize thinking bubble, commit any accumulated reply
           if (ev.event === 'agent' && ev.payload?.stream === 'tool' && ev.payload?.data?.phase === 'start') {
             finalizeCallThinkingBubble();
-            commitSegment();
+            if (replyEl && reply) {
+              enqueueTts(reply);
+              replyEl = null;
+              reply = '';
+            }
           }
           // Assistant delta
           if (ev.event === 'agent' && ev.payload?.stream === 'assistant') {
             const d = ev.payload?.data?.delta;
             if (d) {
               finalizeCallThinkingBubble();
-              if (thinking.classList.contains('msg--thinking')) {
-                thinking.className = 'msg msg--assistant';
-                thinking.textContent = '';
+              if (!replyEl) {
+                replyEl = appendMessage('assistant', '');
               }
               reply += d;
-              thinking.textContent = reply;
+              replyEl.textContent = reply;
               document.getElementById('messages').scrollTop = 9999;
             }
           }
@@ -277,10 +260,9 @@ btnCall.addEventListener('click', async () => {
       } catch (err) {
         if (err.name !== 'AbortError') {
           console.error('[call] streamChat error:', err);
-          thinking.className = 'msg msg--assistant';
-          thinking.textContent = `[错误] ${err.message}`;
-          thinking.style.color = 'var(--danger)';
-          delete thinking.dataset.currentTurn;
+          const errEl = replyEl || appendMessage('assistant', '');
+          errEl.textContent = `[错误] ${err.message}`;
+          errEl.style.color = 'var(--danger)';
           return;
         }
       }
@@ -291,21 +273,15 @@ btnCall.addEventListener('click', async () => {
 
       // Stale check: barge-in happened during this turn
       if (myGeneration !== generation) {
-        if (thinking.parentNode) {
-          thinking.className = 'msg msg--assistant';
-          thinking.textContent = (reply || '...') + '（被打断）';
-          delete thinking.dataset.currentTurn;
+        if (replyEl) {
+          replyEl.textContent = (reply || '...') + '（被打断）';
         }
         return;
       }
 
-      // Commit final segment
-      delete thinking.dataset.currentTurn;
-      if (reply) {
-        thinking.className = 'msg msg--assistant';
+      // Commit final reply segment
+      if (reply && replyEl) {
         enqueueTts(reply);
-      } else if (thinking.parentNode) {
-        thinking.remove();
       }
     },
     async () => {
