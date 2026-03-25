@@ -222,6 +222,7 @@ export function appendStaticToolBubble(name, args, result) {
 
 // Static thinking bubble for history replay — done-state, collapsed
 export function appendStaticThinkingBubble(text) {
+  if (!getSetting('showThinking')) return;
   const { wrap, dot, nameEl, content } = createThinkingBubble();
   dot.className = 'tool-dot done';
   nameEl.textContent = '已思考';
@@ -254,7 +255,7 @@ on('agent-event', (event) => {
     }
   } else if (phase === 'result') {
     const els = toolCallMap.get(toolCallId);
-    if (!els) return;
+    if (!els) return; // start was skipped (showToolCalls off) or toolCallId unknown
 
     // update status indicator
     els.dot.className = 'tool-dot done';

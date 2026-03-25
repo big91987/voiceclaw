@@ -52,7 +52,7 @@ async function loadHistory(agentId, sessionId) {
             appendStaticToolBubble(block.name, block.arguments, result);
           } else if (block.type === 'thinking') {
             const text = block.thinking || block.text;
-            if (text && getSetting('showThinking')) appendStaticThinkingBubble(text);
+            if (text) appendStaticThinkingBubble(text);
           }
         }
       } else if (typeof content === 'string' && content) {
