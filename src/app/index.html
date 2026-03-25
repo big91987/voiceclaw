@@ -37,6 +37,33 @@
         </div>
         <p class="settings-hint">指向 OpenClaw 的配置目录，里面有 agents/ 文件夹</p>
       </div>
+      <div class="settings-group">
+        <label>显示</label>
+        <div class="toggle-row">
+          <span>显示思考过程</span>
+          <label class="toggle-switch">
+            <input type="checkbox" id="setting-show-thinking">
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+        <div class="toggle-row">
+          <span>显示工具调用</span>
+          <label class="toggle-switch">
+            <input type="checkbox" id="setting-show-tool-calls">
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+      </div>
+      <div class="settings-group">
+        <label>通话</label>
+        <div class="settings-row">
+          <span style="font-size:0.9em;color:var(--text)">打断模式</span>
+          <select id="setting-call-queue-mode">
+            <option value="interrupt">打断</option>
+            <option value="queue">排队</option>
+          </select>
+        </div>
+      </div>
     </div>
     <aside id="tasks-sidebar" class="sidebar--hidden">
       <div id="tasks-panel"></div>
