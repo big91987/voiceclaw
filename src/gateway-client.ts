@@ -274,7 +274,9 @@ export class GatewayClient {
     };
 
     // ensure tool results are included in events
-    await this.patchSession(sessionKey, { verboseLevel: 'full' }).catch(() => {});
+    await this.patchSession(sessionKey, { verboseLevel: 'full', reasoningLevel: 'stream' }).catch((e) => {
+      console.warn('[gateway] patchSession failed:', e?.message || e);
+    });
 
     return new Promise((resolve) => {
       this.pendingResolves.set(id, (frame: any) => {

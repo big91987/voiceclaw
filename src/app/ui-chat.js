@@ -1,6 +1,6 @@
 // src/app/ui-chat.js — conversation messages + streaming assistant replies
 import { streamChat, fetchChatHistory, getOpenClawPath, on } from './api.js';
-import { appendStaticToolBubble } from './ui-tasks.js';
+import { appendStaticToolBubble, createThinkingBubble } from './ui-tasks.js';
 
 const messagesEl = document.getElementById('messages');
 let currentSessionKey = null;
@@ -83,6 +83,19 @@ export async function sendMessage({ text, agentId, reuseSession, sessionKey, que
   thinking.dataset.currentTurn = '1';  // marker so tool bubbles can insert before it
   let fullText = '';
 
+  // Thinking bubble for reasoning stream
+  let thinkingBubble = null;
+
+  function getOrCreateThinkingBubble() {
+    if (!thinkingBubble) {
+      thinkingBubble = createThinkingBubble();
+      const turnEl = messagesEl.querySelector('[data-current-turn]');
+      if (turnEl) messagesEl.insertBefore(thinkingBubble.wrap, turnEl);
+      else messagesEl.appendChild(thinkingBubble.wrap);
+    }
+    return thinkingBubble;
+  }
+
   try {
     for await (const event of streamChat({ message: text, agentId, sessionKey, reuseSession, queueMode })) {
       if (event.done) break;
@@ -93,10 +106,40 @@ export async function sendMessage({ text, agentId, reuseSession, sessionKey, que
         onSessionKeyCallback?.(currentSessionKey);
       }
 
+      // Reasoning/thinking stream
+      if (event.event === 'agent' && event.payload?.stream === 'thinking') {
+        const raw = event.payload?.data?.text;
+        if (typeof raw === 'string' && raw) {
+          const tb = getOrCreateThinkingBubble();
+          // Strip "Reasoning:\n" prefix and "_..._" markdown italics
+          const stripped = raw
+            .replace(/^Reasoning:\n/i, '')
+            .replace(/^_|_$/gm, '');
+          tb.content.textContent = stripped;
+          messagesEl.scrollTop = messagesEl.scrollHeight;
+        }
+      }
+
+      // Tool call start — finalize current thinking bubble so each phase gets its own
+      if (event.event === 'agent' && event.payload?.stream === 'tool' &&
+          event.payload?.data?.phase === 'start') {
+        if (thinkingBubble) {
+          thinkingBubble.dot.className = 'tool-dot done';
+          thinkingBubble.nameEl.textContent = '已思考';
+          thinkingBubble = null;
+        }
+      }
+
       // Stream assistant text
       if (event.event === 'agent' && event.payload?.stream === 'assistant') {
         const delta = event.payload?.data?.delta;
         if (typeof delta === 'string' && delta) {
+          // Finalize thinking bubble once assistant text starts
+          if (thinkingBubble) {
+            thinkingBubble.dot.className = 'tool-dot done';
+            thinkingBubble.nameEl.textContent = '已思考';
+            thinkingBubble = null;
+          }
           if (thinking.classList.contains('msg--thinking')) {
             thinking.className = 'msg msg--assistant';
             thinking.textContent = '';
@@ -115,6 +158,11 @@ export async function sendMessage({ text, agentId, reuseSession, sessionKey, que
 
   if (!fullText && thinking.parentNode) {
     thinking.remove();
+  }
+  // Finalize thinking bubble if it wasn't closed by assistant text
+  if (thinkingBubble) {
+    thinkingBubble.dot.className = 'tool-dot done';
+    thinkingBubble.nameEl.textContent = '已思考';
   }
   delete thinking.dataset.currentTurn;
 }

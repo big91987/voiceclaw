@@ -176,6 +176,33 @@ function createToolBubble(toolCallId, name) {
   return { wrap, dot, status, detail };
 }
 
+// Thinking/reasoning stream bubble — collapsible, default collapsed
+export function createThinkingBubble() {
+  const wrap = document.createElement('div');
+  wrap.className = 'msg--tool msg--thinking-bubble';
+
+  const summary = document.createElement('div');
+  summary.className = 'tool-summary';
+
+  const dot = document.createElement('div');
+  dot.className = 'tool-dot thinking';
+
+  const nameEl = document.createElement('span');
+  nameEl.className = 'tool-name';
+  nameEl.textContent = '思考中';
+
+  summary.append(dot, nameEl);
+
+  const content = document.createElement('div');
+  content.className = 'tool-detail thinking-content';
+  content.hidden = true;
+
+  summary.addEventListener('click', () => { content.hidden = !content.hidden; });
+
+  wrap.append(summary, content);
+  return { wrap, dot, nameEl, content };
+}
+
 // Static tool bubble for history replay
 export function appendStaticToolBubble(name, args, result) {
   const { wrap, dot, status, detail } = createToolBubble('history-' + name + '-' + Date.now(), name);

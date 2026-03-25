@@ -170,8 +170,11 @@ canvas { border-radius: 4px; background: var(--bg3); }
   border-radius: 50%;
   flex-shrink: 0;
 }
-.tool-dot.running { background: #f9c74f; }
-.tool-dot.done    { background: #52c878; }
+.tool-dot.running  { background: #f9c74f; }
+.tool-dot.done     { background: #52c878; }
+.tool-dot.thinking { background: #7eb8f7; animation: pulse 1.2s ease-in-out infinite; }
+.msg--thinking-bubble .tool-name { color: #7eb8f7; }
+.thinking-content { font-family: monospace; font-size: 12px; color: #888; white-space: pre-wrap; max-height: 300px; overflow-y: auto; }
 .tool-name   { color: #c8a0ff; font-weight: 500; }
 .tool-status { color: #666; font-size: 11px; }
 .tool-detail {
