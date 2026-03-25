@@ -285,19 +285,22 @@ btnCall.addEventListener('click', async () => {
       }
     },
     async () => {
-      // barge-in: bump generation, abort gateway run + SSE stream + TTS
+      // barge-in: capture refs BEFORE any await to avoid race with new turn
+      const acToAbort = currentAc;
+      const runIdToAbort = currentRunId;
+      const sessionKeyToAbort = currentSessionKey;
       generation++;
       stopSpeaking();
-      if (currentRunId && currentSessionKey) {
+      if (runIdToAbort && sessionKeyToAbort) {
         try {
           await fetch('/api/chat/abort', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ runId: currentRunId, sessionKey: currentSessionKey }),
+            body: JSON.stringify({ runId: runIdToAbort, sessionKey: sessionKeyToAbort }),
           });
         } catch {}
       }
-      currentAc?.abort();
+      acToAbort?.abort();
     },
     () => {
       // onReady: ASR initialized, show waveform

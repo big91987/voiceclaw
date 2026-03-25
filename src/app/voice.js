@@ -93,9 +93,13 @@ export async function speak(text) {
   const blob = await r.blob();
   const url = URL.createObjectURL(blob);
   ttsAudio = new Audio(url);
-  ttsAudio.onended = () => { setVadThreshold(0.01); URL.revokeObjectURL(url); ttsAudio = null; };
-  ttsAudio.play();
-  return ttsAudio;
+  return new Promise((resolve) => {
+    const cleanup = () => { setVadThreshold(0.01); URL.revokeObjectURL(url); ttsAudio = null; resolve(); };
+    ttsAudio.onended = cleanup;
+    ttsAudio.onerror = cleanup;
+    ttsAudio.onpause = cleanup; // resolves if stopSpeaking() is called mid-play
+    ttsAudio.play().catch(cleanup);
+  });
 }
 
 export function stopSpeaking() {
