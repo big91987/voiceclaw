@@ -59,7 +59,7 @@ Storage: `localStorage` with key prefix `vc_setting_`. Falls back to `DEFAULTS` 
 |-----|------|---------|-------------|
 | `showThinking` | boolean | `true` | Show/hide thinking bubbles in chat and history |
 | `showToolCalls` | boolean | `true` | Show/hide tool call bubbles in chat and history |
-| `callQueueMode` | `"interrupt" \| "queue"` | `"interrupt"` | How new voice input is handled when agent is busy |
+| `callQueueMode` | `"interrupt" \| "queue"` | `"interrupt"` | How new voice input is handled when agent is busy — **voice call path only**, not text chat |
 
 All settings are global (apply to all agents).
 
@@ -73,7 +73,16 @@ Toggling a setting takes effect on the **next message** — existing bubbles in 
 
 **Problem:** `loadHistory` in `ui-chat.js` silently skips `type: "thinking"` content blocks with `// skip 'thinking' blocks`.
 
-**Fix:** Handle `block.type === 'thinking'` — call `appendStaticThinkingBubble(block.thinking)` if `getSetting('showThinking')` is true.
+**Fix:** Handle `block.type === 'thinking'` — call `appendStaticThinkingBubble(text)` if `getSetting('showThinking')` is true.
+
+The thinking text field must be read defensively (Anthropic API shape uses `block.thinking`, some providers normalize to `block.text`):
+
+```js
+} else if (block.type === 'thinking') {
+  const text = block.thinking || block.text;
+  if (text && getSetting('showThinking')) appendStaticThinkingBubble(text);
+}
+```
 
 `appendStaticThinkingBubble(text)` added to `ui-tasks.js`: creates a done-state, collapsed thinking bubble (same visual as a finalized live bubble). Appended to `#messages`.
 
@@ -81,17 +90,26 @@ Toggling a setting takes effect on the **next message** — existing bubbles in 
 
 **Problem:** When an agent turn has multiple thinking phases (e.g. initial reasoning → tool call → more reasoning), new thinking events update the same bubble instead of starting a fresh one.
 
-**Fix:** In `sendMessage`, before creating a new thinking bubble, always finalize the existing one:
+**Fix:** Extract a `finalizeThinkingBubble(tb)` helper in `ui-chat.js` (replaces the three inline finalization patterns already in the file):
+
+```js
+function finalizeThinkingBubble(tb) {
+  tb.dot.className = 'tool-dot done';
+  tb.nameEl.textContent = '已思考';
+}
+```
+
+Then in the `thinking` stream handler, finalize the existing bubble before creating a new one:
 
 ```js
 if (event.payload?.stream === 'thinking') {
-  if (thinkingBubble) { finalize(thinkingBubble); thinkingBubble = null; }
+  if (thinkingBubble) { finalizeThinkingBubble(thinkingBubble); thinkingBubble = null; }
   const tb = getOrCreateThinkingBubble();
   // update tb content
 }
 ```
 
-This ensures each reasoning phase gets its own bubble.
+All three existing inline finalization sites (assistant text start, tool-call start, stream end) must also be updated to use the helper.
 
 ---
 
@@ -110,7 +128,12 @@ Toggle styling: standard CSS toggle switch, matches existing dark theme.
 
 ---
 
-## Data Flow
+## Implementation Notes
+
+- `showToolCalls` setting guards bubble creation at the `phase === 'start'` branch entry point in both the live stream handler and `appendStaticToolBubble`. Affects both live and history tool bubbles.
+- `showThinking` setting guards both the live thinking stream handler and `appendStaticThinkingBubble` in `loadHistory`.
+- Each new toggle/select in `ui-settings.js` must be initialized from `getSetting` on load (not just left unchecked), and wired to `setSetting` on `change`.
+- `callQueueMode` only replaces the hardcoded `'interrupt'` in `main.js` line ~221 (the voice call `streamChat` call), not the text chat path.
 
 ```
 User toggles setting
