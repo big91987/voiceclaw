@@ -119,7 +119,6 @@ export async function sendMessage({ text, agentId, reuseSession, sessionKey, que
         if (!getSetting('showThinking')) continue;
         const raw = event.payload?.data?.text;
         if (typeof raw === 'string' && raw) {
-          if (thinkingBubble) { finalizeThinkingBubble(thinkingBubble); thinkingBubble = null; }
           const tb = getOrCreateThinkingBubble();
           // Strip "Reasoning:\n" prefix and "_..._" markdown italics
           const stripped = raw
