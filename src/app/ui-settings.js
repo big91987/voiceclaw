@@ -28,6 +28,11 @@ export function initSettingsTab(onPathChange) {
   const callQueueModeEl = document.getElementById('setting-call-queue-mode');
   callQueueModeEl.value = getSetting('callQueueMode');
   callQueueModeEl.addEventListener('change', () => setSetting('callQueueMode', callQueueModeEl.value));
+
+  // Initialize and wire injectPara toggle
+  const injectParaEl = document.getElementById('setting-inject-para');
+  injectParaEl.checked = getSetting('injectPara');
+  injectParaEl.addEventListener('change', () => setSetting('injectPara', injectParaEl.checked));
 }
 
 export function getCurrentPath() {

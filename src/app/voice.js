@@ -146,7 +146,7 @@ export async function startCall(onFinal, onBargeIn, onReady) {
       console.log('[voice] final:', msg.text);
       if (partialEl) { partialEl.remove(); partialEl = null; }
       const t = msg.text; partialText = '';
-      onFinal(t);
+      onFinal(t, msg.additions);
     }
   });
 

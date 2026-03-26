@@ -157,10 +157,34 @@ btnCall.addEventListener('click', async () => {
   let generation = 0;
 
   await startCall(
-    async (text) => {
+    async (text, additions) => {
       // Voice final → send to agent, stream reply, speak it
       const myGeneration = ++generation;
-      appendMessage('user', text);
+      const userEl = appendMessage('user', text);
+
+      // Render compact para badge if we have additions
+      if (additions) {
+        const parts = [];
+        if (additions.emotion) {
+          const degMap = { 'slight': '轻微', 'moderate': '中等', 'strong': '强烈' };
+          const emoMap = { 'happy': '开心😄', 'sad': '悲伤😢', 'angry': '愤怒😠', 'fearful': '恐惧😨', 'disgusted': '厌恶😒', 'surprised': '惊讶😲', 'neutral': '平静😐' };
+          const emoLabel = emoMap[additions.emotion] || additions.emotion;
+          const degLabel = additions.emotion_degree ? degMap[additions.emotion_degree] || additions.emotion_degree : '';
+          parts.push(degLabel ? `${emoLabel}(${degLabel})` : emoLabel);
+        }
+        if (additions.gender) {
+          parts.push(additions.gender === 'male' ? '♂' : additions.gender === 'female' ? '♀' : additions.gender);
+        }
+        if (additions.speech_rate != null) {
+          parts.push(`${Number(additions.speech_rate).toFixed(1)}t/s`);
+        }
+        if (parts.length > 0) {
+          const badge = document.createElement('span');
+          badge.className = 'para-badge';
+          badge.textContent = parts.join(' · ');
+          userEl.appendChild(badge);
+        }
+      }
 
       const agentId = getAgentId();
       if (!agentId) {
@@ -203,9 +227,28 @@ btnCall.addEventListener('click', async () => {
       const ac = new AbortController();
       currentAc = ac;
 
+      // Optionally inject para prefix into message
+      let messageText = text;
+      if (additions && getSetting('injectPara')) {
+        const degMap = { 'slight': '轻微', 'moderate': '中等', 'strong': '强烈' };
+        const emoMap = { 'happy': '开心', 'sad': '悲伤', 'angry': '愤怒', 'fearful': '恐惧', 'disgusted': '厌恶', 'surprised': '惊讶', 'neutral': '平静' };
+        const paraItems = [];
+        if (additions.emotion) {
+          const emoLabel = emoMap[additions.emotion] || additions.emotion;
+          const degLabel = additions.emotion_degree ? degMap[additions.emotion_degree] || additions.emotion_degree : '';
+          paraItems.push(`情绪=${emoLabel}${degLabel ? `(${degLabel})` : ''}`);
+        }
+        if (additions.gender) {
+          paraItems.push(`性别=${additions.gender === 'male' ? '男' : additions.gender === 'female' ? '女' : additions.gender}`);
+        }
+        if (additions.speech_rate != null) paraItems.push(`语速=${Number(additions.speech_rate).toFixed(1)}token/s`);
+        if (additions.volume != null) paraItems.push(`音量=${Number(additions.volume).toFixed(1)}dB`);
+        if (paraItems.length > 0) messageText = `[副语言: ${paraItems.join(', ')}]\n${text}`;
+      }
+
       try {
         for await (const ev of streamChat({
-          message: text,
+          message: messageText,
           agentId,
           sessionKey: callSessionKey,
           reuseSession: true,

@@ -36,6 +36,7 @@ body {
 .msg--user      { align-self: flex-end; background: var(--accent); color: #fff; }
 .msg--assistant { align-self: flex-start; background: var(--bg3); }
 .msg--thinking  { color: var(--text2); font-style: italic; font-size: 0.9em; align-self: flex-start; }
+.para-badge { display: block; font-size: 0.72em; opacity: 0.75; margin-top: 4px; letter-spacing: 0.02em; }
 
 /* Sidebar */
 #tasks-sidebar {

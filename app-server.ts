@@ -129,10 +129,11 @@ class StreamingAsrSession {
   private lastProcessedText = '';
   private lastUtteranceCount = 0;
   private bargeInSent = false;
+  private currentTurnAdditions: any = null;
 
   constructor(
     private sendEvent: (data: unknown) => void,
-    private onFinal: (text: string) => Promise<void>,
+    private onFinal: (text: string, additions?: any) => Promise<void>,
     private onBargeIn?: () => void,
   ) {}
 
@@ -143,6 +144,7 @@ class StreamingAsrSession {
     this.connectAttempts = 0;
     this.currentTurnText = '';
     this.lastProcessedText = '';
+    this.currentTurnAdditions = null;
     this.processedUtteranceIds.clear();
     this.openSocket();
   }
@@ -174,6 +176,11 @@ class StreamingAsrSession {
           enable_punc: true,
           show_utterances: true,
           end_window_size: 800,
+          enable_emotion_detection: true,
+          enable_gender_detection: true,
+          show_speech_rate: true,
+          show_volume: true,
+          enable_nonstream: true,
         },
       }));
     });
@@ -224,18 +231,24 @@ class StreamingAsrSession {
           if (newDef.length > 0) {
             const turnText = newDef.map((u: any) => String(u?.text || '').trim()).filter(Boolean).join(' ');
             if (turnText) this.currentTurnText += (this.currentTurnText ? ' ' : '') + turnText;
+            // Grab additions from the last definite utterance
+            const lastDef = newDef[newDef.length - 1];
+            log('[ASR server] lastDef additions:', JSON.stringify(lastDef?.additions));
+            if (lastDef?.additions) this.currentTurnAdditions = lastDef.additions;
           }
           if (this.currentTurnText) {
             log('[ASR server] triggering final with definite text:', this.currentTurnText);
             this.runningReply = true;
             const myVersion = ++this.replyVersion;
             const finalText = this.currentTurnText;
-            this.sendEvent({ type: 'final', text: finalText });
+            const finalAdditions = this.currentTurnAdditions;
+            this.sendEvent({ type: 'final', text: finalText, additions: finalAdditions });
             this.lastProcessedText = text;
-            this.onFinal(finalText).finally(() => {
+            this.onFinal(finalText, finalAdditions ?? undefined).finally(() => {
               if (this.replyVersion !== myVersion) return;
               this.runningReply = false;
               this.currentTurnText = '';
+              this.currentTurnAdditions = null;
               this.bargeInSent = false;
             });
           }
@@ -697,7 +710,7 @@ wss.on('connection', (ws, req) => {
 
   const session = new StreamingAsrSession(
     send,
-    async (text) => { send({ type: 'final_ack', text }); },
+    async (text, additions) => { send({ type: 'final_ack', text, additions }); },
     () => { send({ type: 'barge_in' }); },
   );
 

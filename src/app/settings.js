@@ -3,6 +3,7 @@ const DEFAULTS = {
   showThinking: true,
   showToolCalls: true,
   callQueueMode: 'interrupt',
+  injectPara: true,
 };
 
 const PREFIX = 'vc_setting_';
