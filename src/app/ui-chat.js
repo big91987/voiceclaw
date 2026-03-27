@@ -68,12 +68,19 @@ export function getCurrentSessionKey() { return currentSessionKey; }
 
 export function clearSessionKey() { currentSessionKey = null; }
 
+function scrollToBottom() {
+  const threshold = 80;
+  if (messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < threshold) {
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  }
+}
+
 export function appendMessage(role, text) {
   const div = document.createElement('div');
   div.className = `msg msg--${role}`;
   div.textContent = text;
   messagesEl.appendChild(div);
-  messagesEl.scrollTop = messagesEl.scrollHeight;
+  scrollToBottom();
   return div;
 }
 
@@ -125,7 +132,7 @@ export async function sendMessage({ text, agentId, reuseSession, sessionKey, que
             .replace(/^Reasoning:\n/i, '')
             .replace(/^_|_$/gm, '');
           tb.content.textContent = stripped;
-          messagesEl.scrollTop = messagesEl.scrollHeight;
+          scrollToBottom();
         }
       }
 
@@ -147,7 +154,7 @@ export async function sendMessage({ text, agentId, reuseSession, sessionKey, que
           }
           fullText += delta;
           thinking.textContent = fullText;
-          messagesEl.scrollTop = messagesEl.scrollHeight;
+          scrollToBottom();
         }
       }
     }

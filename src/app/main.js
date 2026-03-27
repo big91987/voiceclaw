@@ -158,8 +158,21 @@ btnCall.addEventListener('click', async () => {
 
   await startCall(
     async (text, additions) => {
-      // Voice final → send to agent, stream reply, speak it
+      // Abort previous turn if still running (handles case where no barge-in triggered)
+      const prevAc = currentAc;
+      const prevRunId = currentRunId;
+      const prevSessionKey = currentSessionKey;
       const myGeneration = ++generation;
+      stopSpeaking();
+      prevAc?.abort();
+      if (prevRunId && prevSessionKey) {
+        fetch('/api/chat/abort', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ runId: prevRunId, sessionKey: prevSessionKey }),
+        }).catch(() => {});
+      }
+
       const userEl = appendMessage('user', text);
 
       // Render compact para badge if we have additions
@@ -246,6 +259,10 @@ btnCall.addEventListener('click', async () => {
         if (paraItems.length > 0) messageText = `[副语言: ${paraItems.join(', ')}]\n${text}`;
       }
 
+      // Show waiting indicator immediately after user speaks
+      const waitingEl = appendMessage('assistant', '…');
+      waitingEl.style.opacity = '0.5';
+
       try {
         for await (const ev of streamChat({
           message: messageText,
@@ -257,6 +274,12 @@ btnCall.addEventListener('click', async () => {
         })) {
           if (myGeneration !== generation) break; // barged-in, discard
           if (ev.done) break;
+          // Remove waiting indicator on first meaningful event
+          if (waitingEl.parentNode) {
+            const isMeaningful = (ev.event === 'agent') ||
+              (ev.type === 'metric' && ev.metric === 'gateway_first_delta');
+            if (isMeaningful) waitingEl.remove();
+          }
           // Track the run so barge-in can abort it
           if (ev.type === 'metric' && ev.metric === 'session_start') {
             currentRunId = ev.runId;
@@ -296,11 +319,14 @@ btnCall.addEventListener('click', async () => {
               }
               reply += d;
               replyEl.textContent = reply;
-              document.getElementById('messages').scrollTop = 9999;
+              const m = document.getElementById('messages');
+              if (m.scrollHeight - m.scrollTop - m.clientHeight < 80) m.scrollTop = m.scrollHeight;
             }
           }
         }
       } catch (err) {
+        if (waitingEl.parentNode) waitingEl.remove();
+        if (currentAc === ac) { currentAc = null; currentRunId = null; }
         if (err.name !== 'AbortError') {
           console.error('[call] streamChat error:', err);
           const errEl = replyEl || appendMessage('assistant', '');
@@ -310,8 +336,8 @@ btnCall.addEventListener('click', async () => {
         }
       }
 
-      currentAc = null;
-      currentRunId = null;
+      if (waitingEl.parentNode) waitingEl.remove();
+      if (currentAc === ac) { currentAc = null; currentRunId = null; }
       finalizeCallThinkingBubble();
 
       // Stale check: barge-in happened during this turn
