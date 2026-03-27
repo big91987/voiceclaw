@@ -37,6 +37,9 @@ function serveStatic(res: ServerResponse, filePath: string) {
 let gatewayClient: GatewayClient | null = null;
 let gatewayReady = false;
 
+// Track active chat requests per session to cleanup old handlers
+const activeRequests = new Map<string, () => void>();
+
 async function ensureGateway(): Promise<GatewayClient> {
   if (gatewayClient && gatewayReady && gatewayClient.isConnected()) return gatewayClient;
   gatewayReady = false;
@@ -553,6 +556,7 @@ const server = createServer(async (req, res) => {
     req.on('end', async () => {
       try {
         const { message, agentId, reuseSession, sessionKey, queueMode } = JSON.parse(body);
+        log(`[chat] POST /api/chat message="${message.substring(0,50)}" agentId=${agentId}`);
         if (!message) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: 'Message required' })); return;
@@ -575,15 +579,23 @@ const server = createServer(async (req, res) => {
 
         // 使用全局预连接的 GatewayClient（复用连接，避免每次新建）
         const chatClient = await ensureGateway();
+        log(`[chat] t+${Date.now()-apiStartAt}ms ensureGateway done`);
 
         let finished = false;
+        let resetTimeout: () => void = () => {};
         const finish = () => {
           if (finished) return;
           finished = true;
+          chatClient.offEvent(eventHandler);
+          // Remove from active requests map
+          if (targetSessionKey && activeRequests.get(targetSessionKey) === finish) {
+            activeRequests.delete(targetSessionKey);
+          }
           res.end();
         };
 
         const eventHandler = (event: unknown) => {
+          if (finished) return;
           const e = event as Record<string, unknown>;
           const payload =
             e.payload && typeof e.payload === 'object'
@@ -598,23 +610,28 @@ const server = createServer(async (req, res) => {
             : matchesSession;
 
           if (!shouldForward) {
+            log(`[chat] FILTERED event=${e.event} eventRunId=${eventRunId} eventSession=${eventSessionKey} targetRun=${targetRunId} targetSession=${targetSessionKey}`);
             return;
           }
 
+          resetTimeout();
           res.write(`data: ${JSON.stringify(e)}\n\n`);
 
           if (e.event === 'agent') {
             const stream = payload?.stream;
             const delta = (payload?.data as Record<string, unknown> | undefined)?.delta;
-            if (stream === 'assistant' && typeof delta === 'string' && delta.length > 0 && !firstGatewayDeltaAt) {
+            if (!firstGatewayDeltaAt) {
               firstGatewayDeltaAt = Date.now();
-              const metric = {
-                type: 'metric', metric: 'gateway_first_delta',
-                at: firstGatewayDeltaAt, ms: firstGatewayDeltaAt - apiStartAt,
-              };
-              res.write(`data: ${JSON.stringify(metric)}\n\n`);
+              log(`[chat] t+${firstGatewayDeltaAt - apiStartAt}ms first agent event (stream=${stream})`);
             }
-          }
+              if (stream === 'assistant' && typeof delta === 'string' && delta.length > 0) {
+                const metric = {
+                  type: 'metric', metric: 'gateway_first_delta',
+                  at: firstGatewayDeltaAt, ms: firstGatewayDeltaAt - apiStartAt,
+                };
+                res.write(`data: ${JSON.stringify(metric)}\n\n`);
+              }
+            }
 
           if (e.event === 'chat') {
             if (payload.state === 'final' || payload.state === 'error') {
@@ -631,18 +648,32 @@ const server = createServer(async (req, res) => {
           sessionKey: sessionKey || '',
           queueMode: queueMode || 'interrupt',
         });
+        log(`[chat] t+${Date.now()-apiStartAt}ms sendAgentMessage done, runId=${started.runId}`);
         targetRunId = started.runId;
         targetSessionKey = started.sessionKey;
+
+        // Cleanup old handler for this session if exists
+        const oldFinish = activeRequests.get(targetSessionKey);
+        if (oldFinish) {
+          log(`[chat] Cleaning up old handler for session ${targetSessionKey}`);
+          oldFinish();
+        }
+        activeRequests.set(targetSessionKey, finish);
+
         res.write(`data: ${JSON.stringify({
           type: 'metric', metric: 'session_start',
           runId: targetRunId, sessionKey: targetSessionKey, reuseSession: !!reuseSession,
         })}\n\n`);
 
-        setTimeout(() => {
-          if (finished) return;
-          res.write('data: [TIMEOUT]\n\n');
-          finish();
-        }, 60000);
+        req.on('close', () => finish());
+
+        // Sliding timeout: reset on every forwarded event
+        const IDLE_TIMEOUT = 60000;
+        let timeoutHandle = setTimeout(() => { if (!finished) { res.write('data: [TIMEOUT]\n\n'); finish(); } }, 180000);
+        resetTimeout = () => {
+          clearTimeout(timeoutHandle);
+          timeoutHandle = setTimeout(() => { if (!finished) { res.write('data: [TIMEOUT]\n\n'); finish(); } }, IDLE_TIMEOUT);
+        };
 
       } catch (err) {
         res.writeHead(500, { 'Content-Type': 'application/json' });
