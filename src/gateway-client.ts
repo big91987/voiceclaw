@@ -232,7 +232,7 @@ export class GatewayClient {
     });
   }
 
-  async abortRun(sessionKey: string, runId: string): Promise<unknown> {
+  async abortRun(sessionKey: string, runId?: string): Promise<unknown> {
     return this.call('chat.abort', { sessionKey, runId });
   }
 
@@ -263,20 +263,23 @@ export class GatewayClient {
     }
 
     const reqFrame = {
-      type: 'req', id, method: 'agent',
+      type: 'req', id, method: 'chat.send',
       params: {
         message,
-        agentId,
         sessionKey,
         idempotencyKey: uuidv4(),
-        deliver: false,
       },
     };
 
-    // ensure tool results are included in events
-    await this.patchSession(sessionKey, { verboseLevel: 'full', reasoningLevel: 'stream' }).catch((e) => {
-      console.warn('[gateway] patchSession failed:', e?.message || e);
-    });
+    // ensure tool results are included in events + clear stuck runs
+    await Promise.all([
+      this.patchSession(sessionKey, { verboseLevel: 'full', reasoningLevel: 'stream' }).catch((e) => {
+        console.warn('[gateway] patchSession failed:', e?.message || e);
+      }),
+      this.abortRun(sessionKey).catch((e) => {
+        console.warn('[gateway] pre-abort failed:', e?.message || e);
+      }),
+    ]);
 
     return new Promise((resolve) => {
       this.pendingResolves.set(id, (frame: any) => {
